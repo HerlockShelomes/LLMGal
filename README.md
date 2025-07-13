@@ -6,7 +6,7 @@
 
 本项目的初衷是期望通过多种大语言模型的模态结合，搭配角色提示词，在大语言模型产生文本回复的同时，提供语音和相对应的情绪图片，为聊天带来更加沉浸的体验。
 
-基础参考了Github上已有的两个项目，一个是[LLM-Chat](https://github.com/STEVENTAN100/LLM-Chat)（基于Apache2.0开源协议），另一个是[AIchat](https://github.com/wjc7jx/AIchat)（基于MIT开源协议）。两者都使用Vue.js完成了前端页面的搭建。本次项目重点关注了[LLM-Chat](https://github.com/STEVENTAN100/LLM-Chat)，并基于该项目搭建了Python后端。[LLM-Chat](https://github.com/STEVENTAN100/LLM-Chat)通过Pinia进行状态管理，使用API通过http请求获取大语言模型回复。另外本项目也在一定程度上参考了B站UP主林亦LYi在视频[《我办了场AI整活儿大赛！B友真的是卧虎藏龙！》](https://www.bilibili.com/video/BV1WtHQewEu4/?spm_id_from=333.1387.upload.video_card.click&vd_source=e6b19ecaf939e2809018f18c647365bd)中提及的Blur AI项目。
+基础参考了Github上已有的两个项目，一个是[LLM-Chat](https://github.com/STEVENTAN100/LLM-Chat)（基于Apache2.0开源协议，对原项目进行过修改的代码将逐步加入注释），另一个是[AIchat](https://github.com/wjc7jx/AIchat)（基于MIT开源协议）。两者都使用Vue.js完成了前端页面的搭建。本次项目重点关注了[LLM-Chat](https://github.com/STEVENTAN100/LLM-Chat)，并基于该项目搭建了Python后端。[LLM-Chat](https://github.com/STEVENTAN100/LLM-Chat)通过Pinia进行状态管理，使用API通过http请求获取大语言模型回复。另外本项目也在一定程度上参考了B站UP主林亦LYi在视频[《我办了场AI整活儿大赛！B友真的是卧虎藏龙！》](https://www.bilibili.com/video/BV1WtHQewEu4/?spm_id_from=333.1387.upload.video_card.click&vd_source=e6b19ecaf939e2809018f18c647365bd)中提及的Blur AI项目。
 
 本项目目前可以实现静态图片资源调用下本地的多模态回复。设置了四个角色供用户选择，并为四个角色设置了不同的提示词。目前文本模型可以切换不同模型调用，增加文本模型的功能还需要修一下，目前除了内置的两个Deepseek模型，其余文本模型的调用会遇到一定问题。
 
@@ -17,10 +17,12 @@
 
 2. 增加模型调用API-Key输入功能，并在设置面板上允许用户微调模型参数。目前开发阶段的API是固定的作者自己日常会使用的API，API-key输入面板和模型参数面板虽然存在但无法调参；
 
-3. 增加新角色创建界面，有两个方向可以选择：创建虚拟角色或者创建某人的数字分身。
+4. 增加新角色创建界面，有两个方向可以选择：创建虚拟角色或者创建某人的数字分身。
 
-- 虚拟角色的创建由用户自定义，性格提示词、形象、声音全部都可以选择；
-- 数字分身界面将通过用户与“心理医生”AI的对话，结合用户的历史数据撰写属于用户自己的性格提示词。后期本项目会开放音色还原大模型接口，通过采集用户音频实现音色复刻。同时，用户可以自定义自身的虚拟形象。
+   - 虚拟角色的创建由用户自定义，性格提示词、形象、声音全部都可以选择；
+
+   - 数字分身界面将通过用户与“心理医生”AI的对话，结合用户的历史数据撰写属于用户自己的性格提示词。后期本项目会开放音色还原大模型接口，通过采集用户音频实现音色复刻。同时，用户可以自定义自身的虚拟形象。
+
 
 4. 实现服务器部署，并基于此提供交友功能（此处借鉴Blur AI项目）。用户可以注册账号并登录，在网络上同其他人创建的虚拟角色或数字分身对话。
 
@@ -81,16 +83,18 @@ npm install
 npm run dev
 ```
 
-3. 启用后端Python的WebSocket服务：
+3. 启用后端Python的WebSocket服务（另开一个Anaconda Prompt终端）：
 
 ```python
-# 启动服务
+# 启用虚拟环境
+conda activate vue-fastapi
+# 找到项目的backend文件夹，在backend文件夹内启动服务
 python -m uvicorn Connect:app --reload
 # 后端调试指令，预期的请求应通过
 pytest tests/test_websocket.py -v
 ```
 
-4. 此时到前端，通过设置页面选择角色，然后**确认设置更改**之后，输入消息，等待一定时间（依据模型的调用速度，可以从启用后端WebSocket服务的终端内确认消息进展，一般而言Deepseek-R1的调用速度会明显低于Deepseek-V3）就能在获得文本回复的同时听见语音。
+4. 此时到前端打开网页，通过设置页面选择角色，然后**确认设置更改**之后，输入消息，等待一定时间（依据模型的调用速度，可以从启用后端WebSocket服务的终端内确认消息进展，一般而言Deepseek-R1的调用速度会明显低于Deepseek-V3）就能在获得文本回复的同时听见语音。
 
 
 
