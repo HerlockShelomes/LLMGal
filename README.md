@@ -44,7 +44,7 @@
 
 该项目的基本服务流程为：
 
-<img src="G:\保研&留学\浙江大学\软院夏令营\Vue-FastAPI.png" alt="Vue-FastAPI" style="zoom: 67%;" />
+<img src="Vue-FastAPI.png" alt="Vue-FastAPI" style="zoom: 67%;" />
 
 该项目的技术栈为：前端Vue.js界面 + 后端Python业务处理逻辑。通过WebSocket实现前后端交互逻辑。
 
