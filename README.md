@@ -32,7 +32,7 @@
 
 后端：使用厂商提供API完成输入并获取大语言模型回复（文本模型使用O3网站API，AI绘画及语音合成均使用火山引擎API），同时使用基于FastAPI的WebSocket与前端通信。
 
-![image-20250713202649144](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20250713202649144.png)
+![WebPage_Image](WebPage_Image.png)
 
 #### 基本页面展示
 
