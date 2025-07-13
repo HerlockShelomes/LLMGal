@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ],
+  "compilerOptions": {
+    "types": ["element-plus/global","vite/client", "node"],  // 显式包含Node类型
+    "moduleResolution": "node",        // 确保模块解析方式正确
+    "allowSyntheticDefaultImports": true
+  }
+}
