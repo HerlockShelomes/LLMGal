@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+.venv-module1/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+frontend/node_modules/
+artifacts/test-results/*.xml

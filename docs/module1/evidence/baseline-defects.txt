@@ -1,0 +1,101 @@
+修复前基线（2026-09-10，命令：./scripts/run_module1_tests.sh -q）
+
+FFF                                                                      [100%]
+=================================== FAILURES ===================================
+__________ test_error_response_uses_frontend_server_message_envelope ___________
+
+    @pytest.mark.asyncio
+    async def test_error_response_uses_frontend_server_message_envelope():
+        websocket = ScriptedWebSocket()
+
+>       await Connect.send_error(websocket, "JSON_PARSE_ERROR", "bad json", message_id="msg-001")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: send_error() got an unexpected keyword argument 'message_id'
+
+backend/tests/test_websocket_protocol.py:59: TypeError
+_ test_process_failure_returns_one_error_and_does_not_use_unassigned_response __
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x1099e5e50>
+
+    @pytest.mark.asyncio
+    async def test_process_failure_returns_one_error_and_does_not_use_unassigned_response(monkeypatch):
+        websocket = ScriptedWebSocket([json.dumps(valid_message())])
+
+        def fail_process(_request):
+            raise RuntimeError("mock processing failure")
+
+        monkeypatch.setattr(Connect, "process_query", fail_process)
+
+        await Connect.websocket_chat(websocket)
+
+>       assert [message["payload"]["code"] for message in websocket.sent] == ["PROCESS_ERROR"]
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+backend/tests/test_websocket_protocol.py:86:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+.0 = <list_iterator object at 0x10a9f34f0>
+
+>   assert [message["payload"]["code"] for message in websocket.sent] == ["PROCESS_ERROR"]
+            ^^^^^^^^^^^^^^^^^^
+E   KeyError: 'payload'
+
+backend/tests/test_websocket_protocol.py:86: KeyError
+------------------------------ Captured log call -------------------------------
+ERROR    root:Connect.py:240 处理查询失败: mock processing failure
+ERROR    root:Connect.py:284 WebSocket Fetal Error.
+Traceback (most recent call last):
+  File "/Users/fangweijun/Documents/ChatGPT/软件测试与质量保证/LLMGal/backend/Connect.py", line 249, in websocket_chat
+    "response": resp.response,
+                ^^^^
+UnboundLocalError: cannot access local variable 'resp' where it is not associated with a value
+_____________ test_missing_nested_model_field_is_validation_error ______________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10a9af750>
+
+    @pytest.mark.asyncio
+    async def test_missing_nested_model_field_is_validation_error(monkeypatch):
+        message = valid_message()
+        del message["payload"]["textModel_config"]["modelText"]
+        websocket = ScriptedWebSocket([json.dumps(message)])
+        process_calls = 0
+
+        def count_process(_request):
+            nonlocal process_calls
+            process_calls += 1
+            raise AssertionError("invalid input must not reach process_query")
+
+        monkeypatch.setattr(Connect, "process_query", count_process)
+
+        await Connect.websocket_chat(websocket)
+
+>       assert process_calls == 0
+E       assert 1 == 0
+
+backend/tests/test_websocket_protocol.py:105: AssertionError
+------------------------------ Captured log call -------------------------------
+ERROR    root:Connect.py:240 处理查询失败: invalid input must not reach process_query
+ERROR    root:Connect.py:284 WebSocket Fetal Error.
+Traceback (most recent call last):
+  File "/Users/fangweijun/Documents/ChatGPT/软件测试与质量保证/LLMGal/backend/Connect.py", line 249, in websocket_chat
+    "response": resp.response,
+                ^^^^
+UnboundLocalError: cannot access local variable 'resp' where it is not associated with a value
+- generated xml file: /Users/fangweijun/Documents/ChatGPT/软件测试与质量保证/LLMGal/artifacts/test-results/module1-junit.xml -
+================================ tests coverage ================================
+______________ coverage: platform darwin, python 3.11.15-final-0 _______________
+
+Name                     Stmts   Miss  Cover   Missing
+------------------------------------------------------
+backend/Connect.py         138     74    46%   22-26, 30-32, 40-70, 171-206, 210, 222-224, 228-229, 234-236, 259-276, 279-280, 282, 310-311, 314-315
+backend/Image.py           115     99    14%   29-45, 48-66, 70-88, 92-135, 149-213, 220-251, 279-283
+backend/Integration.py     109     99     9%   44-82, 86-95, 116-207
+backend/Text.py             34     29    15%   12-23, 32-58, 61-62
+backend/Voice.py           160    133    17%   37-61, 65-124, 127-183, 188-189, 192-204, 209-265, 270
+------------------------------------------------------
+TOTAL                      556    434    22%
+=========================== short test summary info ============================
+FAILED backend/tests/test_websocket_protocol.py::test_error_response_uses_frontend_server_message_envelope
+FAILED backend/tests/test_websocket_protocol.py::test_process_failure_returns_one_error_and_does_not_use_unassigned_response
+FAILED backend/tests/test_websocket_protocol.py::test_missing_nested_model_field_is_validation_error
+3 failed in 1.45s
