@@ -106,6 +106,59 @@ npm run dev
 
 ## 测试与质量检查
 
+### 模块一：隔离自动化测试
+
+模块一测试工程位于以下路径：
+
+```text
+LLMGal/
+├── backend/
+│   ├── tests/
+│   │   ├── conftest.py                      # 公共 Mock、Stub 和网络阻断配置
+│   │   ├── test_websocket_cases.py          # WebSocket、配置、异常和 ACK 测试（14 条）
+│   │   └── test_service_and_state_cases.py  # 文本、语音、图片和资源状态测试（20 条）
+│   └── requirements-test.txt                # 独立测试依赖
+├── scripts/
+│   └── run_module1_tests.sh                 # 一键运行全部 34 条用例
+└── docs/module1/
+    └── LLMGal_backend_34_test_cases.md       # 34 条测试用例清单
+```
+
+真正执行 34 条测试用例的代码集中在 `backend/tests/`：
+
+- [`backend/tests/test_websocket_cases.py`](backend/tests/test_websocket_cases.py)：包含 14 条 WebSocket 消息、嵌套配置、断线和 ACK 协议测试。
+- [`backend/tests/test_service_and_state_cases.py`](backend/tests/test_service_and_state_cases.py)：包含 20 条文本、语音、图片、资源索引、异常和并发状态测试。
+- [`backend/tests/conftest.py`](backend/tests/conftest.py)：由 pytest 自动加载，为上述测试提供公共导入配置、第三方 SDK Stub 和真实网络阻断，不单独计算为测试用例。
+
+测试函数名直接包含清单编号。例如，清单中的 `TC-WS-01` 对应 `test_tc_ws_01_valid_static_request_full_flow`，可以据此从用例清单定位到具体代码。
+
+在仓库根目录执行以下命令，即可自动创建 Python 3.11 虚拟环境、安装精简测试依赖并运行全部 34 个后端单元测试：
+
+```bash
+./scripts/run_module1_tests.sh
+```
+
+如需显示每条用例名称：
+
+```bash
+./scripts/run_module1_tests.sh -v
+```
+
+34 个测试函数与 [`docs/module1/LLMGal_backend_34_test_cases.md`](docs/module1/LLMGal_backend_34_test_cases.md) 中的用例编号一一对应，覆盖配置映射、情绪解析、资源索引边界、静态与实时图像分支、文本提示词、语音保存、HTTP 请求结构、健康检查及 WebSocket 错误协议。文本模型、语音和图像相关依赖均使用固定 Mock/Stub；测试夹具会阻断遗漏的真实 HTTP 与 WebSocket 调用，因此不需要 API Key，不会调用真实大模型或产生第三方服务费用。
+
+当前原始源码的基线结果为 `32 passed, 2 xfailed`。两条预期失败分别为 `TC-TTS-04`（非法 Base64 会产生零字节音频）和 `TC-EX-02`（非数字索引在清单预期的处理阶段之前即匹配失败）。`xfail(strict=True)` 用于稳定复现并保留缺陷证据；修复后如果行为改变，测试会以 XPASS 使脚本失败，提醒更新缺陷验证结果。
+
+执行结果保存在：
+
+- `artifacts/test-results/pytest-output.txt`：终端执行日志与覆盖率摘要
+- `artifacts/test-results/module1-junit.xml`：可供持续集成或报告工具读取的 JUnit 结果
+
+如果 Python 3.11 的命令名称不同，可以显式指定解释器：
+
+```bash
+LLMGAL_TEST_PYTHON=/path/to/python3.11 ./scripts/run_module1_tests.sh
+```
+
 ### 前端测试
 
 ```bash
@@ -131,7 +184,7 @@ python -m pytest test_websocket.py -v
 
 该测试会调用真实的文本、语音和图像服务，需要有效测试凭据和网络连接，可能产生调用费用。它不属于隔离的单元测试。
 
-当前全部测试可在后端已启动时用一条命令依次执行：
+前端测试和原有后端端到端测试可在后端已启动时依次执行：
 
 ```bash
 (cd frontend && npm test -- --run) && (cd backend && python -m pytest test_websocket.py -v)
@@ -147,7 +200,7 @@ npm run build
 
 ## 当前状态与推荐被测范围
 
-当前测试基线较小：前端只有一个基础冒烟测试，后端只有一个依赖外部服务的 WebSocket 端到端测试；跨前后端测试还需要预先启动服务。现有代码也仍有 TypeScript 构建、Lint、平台依赖、相对路径和凭据管理问题，适合在课程实践中逐步定位、记录并修复。
+当前包含 34 个与模块一用例清单对应、使用固定 Mock/Stub 的后端隔离单元测试，一个前端基础冒烟测试，以及一个依赖真实外部服务的后端 WebSocket 端到端测试。隔离单元测试可一键执行；端到端测试仍需预先启动服务并配置外部凭据。现有代码仍有 TypeScript 构建、Lint、平台依赖、相对路径和凭据管理问题，需要逐步定位、记录并修复。
 
 建议优先覆盖：
 
@@ -163,9 +216,9 @@ npm run build
 
 - 第三方服务配置尚未统一迁移到环境变量。
 - 实时图像生成、部分模型切换和音色配置仍不完整。
-- 后端测试依赖真实外部服务，尚未使用 Mock 隔离。
+- 原有的 `backend/test_websocket.py` 仍依赖真实外部服务；课程单元测试已通过 Mock/Stub 隔离。
 - 当前前端 `build` 与 `lint` 存在待修复问题。
-- 仓库中包含开发期生成文件，后续应完善根目录 `.gitignore`。
+- 仓库仍包含部分历史开发期生成文件；根目录 `.gitignore` 已覆盖新的测试缓存和结果文件。
 
 ## 项目来源与许可
 

@@ -1,0 +1,7 @@
+fastapi==0.95.1
+pydantic==1.10.7
+pytest==8.4.1
+pytest-asyncio==1.0.0
+pytest-cov==6.2.1
+requests==2.32.4
+websockets==11.0.2
