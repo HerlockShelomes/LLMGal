@@ -1,12 +1,13 @@
 from enum import Enum
+import os
 from volcengine.visual.VisualService import VisualService
 import re
 import sys
 import time
 
 
-ACCESS = 'AKLTODlhZDdkMzc3OTU3NGE3Zjk2NWIwODlkNDY2ZDQ1Y2I'
-SECRET = 'T1RrME1HRTFaVFppWkRNMk5EUTJZMkUwTURnMllUUmhNelZoT1dSa01UZw=='
+ACCESS = os.getenv("LLMGAL_IMAGE_ACCESS_KEY", "")
+SECRET = os.getenv("LLMGAL_IMAGE_SECRET_KEY", "")
 prompt_original = f"""a 9 years old senior citizen with yellow hair and rather thin eyebrows, anime style"""
 
 

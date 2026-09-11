@@ -1,317 +1,267 @@
+"""FastAPI entry point and WebSocket protocol for the LLMGal backend.
+
+The expensive LLM, image, and speech orchestration remains in ``Integration``.
+This module is intentionally limited to request validation, response envelopes,
+and per-connection ACK handling so it can be tested without external services.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import websockets
 import json
-from fastapi import FastAPI, WebSocket
-from pydantic import BaseModel
+import logging
 import time
-from fastapi.encoders import jsonable_encoder
-from starlette.websockets import WebSocketDisconnect, WebSocketState
+from typing import Any
+
+from fastapi import FastAPI, WebSocket
+from pydantic import BaseModel, ValidationError
+from starlette.websockets import WebSocketDisconnect
 
 from Integration import Response_Collection
-import logging
-from websockets.exceptions import ConnectionClosedError
-from Voice import parse_response
-
-# 连接管理器
-class WebSocketManager:
-    def __init__(self):
-        self.active_connections = {}
-
-    async def connect_inner(self, url, headers):
-        """创建完全独立的内部连接"""
-        inner_ws = await websockets.connect(url, extra_headers=headers, ping_interval=None)
-
-        conn_id = id(inner_ws)
-        self.active_connections[conn_id] = inner_ws
-        return conn_id
-
-    async def close_inner(self, conn_id):
-        """安全关闭内层连接"""
-        if conn_id in self.active_connections:
-            await self.active_connections[conn_id].close()
-            del self.active_connections[conn_id]
-
-ws_manager = WebSocketManager()
-
-async def inner_websocket_operation(api_url, full_client, file_to_save):
 
 
-    """隔离的内层WebSocket调用"""
-    try:
-        conn_id = await ws_manager.connect_inner(api_url,
-        {"Authorization": "Bearer; _SRNKZhKXevBrx72wklF-D8NX7LGigGs"}
-        )
-        inner_ws = ws_manager.active_connections[conn_id]
+ACK_TIMEOUT_SECONDS = 30.0
 
-        await inner_ws.send(full_client)
+app = FastAPI(title="LLM Galgame Chat Backend")
 
-        # 安全退出条件
 
-        while True:
-            try:
-                res = await asyncio.wait_for(inner_ws.recv(), timeout=30.0)
-            except asyncio.TimeoutError:
-                break
+class TextModelConfig(BaseModel):
+    """Text-generation settings supplied by the frontend."""
 
-            done = parse_response(res, file_to_save)
-            if done:
-                file_to_save.close()
-                break
+    text: dict[str, Any]
+    modelText: str
 
-    except websockets.ConnectionClosed as e:
-        logging.warning(f'Inner WS closed: {e.code}')
-    finally:
-        # 资源清理
-        if not file_to_save.closed:
-            file_to_save.close()
-        # 安全关闭内层链接
-        if 'conn_id' in locals():
-            await ws_manager.close_inner(conn_id)
-            print('Inner Connection Closed')
 
-# OK, Let's start all this all over again, but for one last time.
-# We are going to build a connection with Vue Frontend.
-# Start the construction with the format of the message.
-# The link will be established with FastAPI.
-# Let's Finish this. 2025.7.9-20:33
+class ImageModelConfig(BaseModel):
+    """Image-generation settings supplied by the frontend."""
 
-# The format of the Received message.
-# {
-#   "type": "client_query",         // 固定消息类型标识
-#   "message_id": "session_1234",  // 客户端生成的唯一消息ID, 注意了解一下生成机理。
-#   "timestamp": "2023-08-20T15:30:00Z", // 不是那么必要，但可以保留，作为消息传输的时间戳。
-#   "payload": {
-#     "textModel_config":{
-#       "text": "请用莎士比亚的风格写首诗",  // 用户输入文本
-#       "modelText": "deepseek-ai/DeepSeek-V3"      // 选择的模型名称
-#     },
-#     "role": "Wendy",                        //角色选择
-#     "imageModel_config": {
-#       "modelImage": "high_aes_ip_v20",      //图片模型选择（文生图亦或图生图）
-#       "realTimeRendering": true       // 是否选择实时渲染
-#     },
-#     "voiceCate": "GirlFriend"    //选择模型使用的音色
-#   }
-# }
-#
-# The message format sending back to the frontend.
-#
-# {
-#   "type": "assistant_response",   //消息类型标识符，用于确认消息格式。
-#   "message_id": "session_1234",   // 必须与请求ID对应，前端获取之后也需要正常返回
-#   "status": "success",            // success/partial/failure  状态表达需要之后规范。
-#   "payload": {
-#     "response": "汝之眼眸如星河璀璨...",  // 模型生成的文本
-#     "emotion": "neutral",          // 情绪标签，具体可生成的情绪标签可参考Integration.py
-#     "index": "0",    // 资源标识符，在0-9之间循环，代表可使用实时生成的图片资源最大数量为10.
-#     "metrics": {
-#       "time_cost": 2.34,          // 单位：秒
-#       "tokens_used": 789
-#     },
-#     imageUrl: "https://xxxx.com" // 更新的图片url，现在传入可能意义不大，因为提取、写入、更新这几步全是在后端完成。但保留这一项，
-#                                  // 后续如果用户希望进一步节省内存，可以直接调用url。url失效时图片会消失，就调用文生图模型重新生成。
-#   }
-# }
-#
-# Error Message Format:
-# {
-#   "type": "error",                            // 消息类型标识符，这一个类型消息指向传输错误；
-#   "message_id": "session_1234",               // 消息ID，从前端传过来的ID和从后端反馈的ID必须要对应一样。
-#   "code": "AUTH_403",                         // 错误代码，指向此次错误的类型。
-#   "message": "无效的音色ID配置",                 // 错误信息，具体描述错误代码的含义
-#   "detail": "voice_id=vivi-3 不存在于配置库"     // 错误详情，指出此次错误的具体原因，便于调试错误。
-# }
-# 好像还没写，后续看能不能完善一下。
+    modelImage: str
+    realTimeRendering: bool
 
-app = FastAPI(title  = "LLM Galgame Chat Backend")
-
-# 等到基础功能实现之后需要完善每一个消息传输的参数验证逻辑。
 
 class ClientRequest(BaseModel):
-    textModel_config: dict
-    # "textModel_config":{
-    #   "text": "请用莎士比亚的风格写首诗",  // 用户输入文本
-    #   "modelText": "deepseek-ai/DeepSeek-V3"      // 选择的模型名称
-    # },
-    role: str
-    # "role": "Wendy",                        //角色选择
-    imageModel_config: dict
-    # "imageModel_config": {
-    #   "modelImage": "high_aes_ip_v20",      //图片模型选择（文生图亦或图生图）
-    #   "realTimeRendering": true       // 是否选择实时渲染
-    # },
-    voiceCate: str
-    # "voiceCate": "GirlFriend"    //选择模型使用的音色
+    """Validated business payload of a ``client_query`` message."""
 
-    # BaseModel是已经包含基本的type, message_id, timestamp, status信息了吗？
-    # 为什么我们构建的时候好像只需要考虑payload里的信息呢？
+    textModel_config: TextModelConfig
+    role: str
+    imageModel_config: ImageModelConfig
+    voiceCate: str
 
 
 class ServerResponse(BaseModel):
+    """Business payload returned to the frontend."""
+
     response: str
-    # "response": "汝之眼眸如星河璀璨...",  // 模型生成的文本
     emotion: str
-    # "emotion": "neutral",          // 情绪标签，具体可生成的情绪标签可参考Integration.py
     index: str
-    # "index": "0",    // 资源标识符，在0-9之间循环，代表可使用实时生成的图片资源最大数量为10.
-    metrics: dict
-    # "metrics": {
-    #   "time_cost": 2.34,          // 单位：秒
-    #   "tokens_used": 789
-    # },
+    metrics: dict[str, Any]
     imageUrl: str
-    # imageUrl: "https://xxxx.com" // 更新的图片url，现在传入可能意义不大，因为提取、写入、更新这几步，全是在后端完成。但保留这一项，
-    #                              // 后续如果用户希望进一步节省内存，可以直接调用url。url失效时图片会消失，就调用文生图模型重新生成。
+
 
 def process_query(request: ClientRequest) -> ServerResponse:
-    """
-    获取从前端传输的数据，
-    调用已有的大语言模型获得回复
-    """
-    default_metrics = { "time_cost": 0, "tokens_used": 0 }
-    respond = ServerResponse(
-        response = "",
-        emotion = "",
-        index = "8",
-        metrics = default_metrics,
-        imageUrl = ""
+    """Run the existing orchestration layer for one validated request."""
+
+    start_time = time.time()
+    response, index, emotion, image_url = Response_Collection(
+        request.textModel_config.modelText,
+        request.imageModel_config.modelImage,
+        request.role,
+        request.voiceCate,
+        request.imageModel_config.realTimeRendering,
+        request.textModel_config.text,
+    )
+    return ServerResponse(
+        response=response,
+        emotion=emotion,
+        index=index,
+        metrics={
+            "time_cost": time.time() - start_time,
+            "tokens_used": len(response),
+        },
+        imageUrl=image_url,
     )
 
-    try:
-        startTime = time.time()
-
-
-        response, indexStr, imageEmo, recentUrl = Response_Collection(request.textModel_config["modelText"],
-                                                                      request.imageModel_config["modelImage"],
-                                                                      request.role,
-                                                                      request.voiceCate,
-                                                                      request.imageModel_config["realTimeRendering"],
-                                                                      request.textModel_config["text"])
-
-        respond.response = response
-        respond.emotion = imageEmo
-        respond.index = indexStr
-        respond.imageUrl = recentUrl
-        stopTime = time.time()
-        # 这一段metrics尚未增入……后续确定一下
-        respond.metrics["tokens_used"] = len(response)
-        respond.metrics["time_cost"] = stopTime - startTime
-        # "metrics": {
-        #   "time_cost": 2.34,          // 单位：秒
-        #   "tokens_used": 789
-        # },
-        return respond
-    except Exception as e:
-        logging.error(f"处理请求异常：{str(e)}")
-        raise
 
 @app.get("/")
-def health_check():
+def health_check() -> dict[str, str]:
     return {"status": "alive"}
 
-@app.websocket("/ws/chat")
-async def websocket_chat(websocket: WebSocket):
-    await websocket.accept()
+
+def _error_message(code: str) -> str:
+    if code == "PROCESS_ERROR":
+        return "请求处理失败。"
+    if code == "SERVER_ERROR":
+        return "内部服务器出错。"
+    return "请求格式出错。"
+
+
+async def send_error(
+    websocket: WebSocket,
+    code: str,
+    detail: str | None = None,
+    *,
+    message_id: str = "",
+) -> None:
+    """Send an error using the same envelope consumed by the frontend."""
+
+    error_message = {
+        "type": "error",
+        "message_id": message_id,
+        "status": "failure",
+        "payload": {
+            "code": code,
+            "message": _error_message(code),
+            "detail": detail or "",
+        },
+    }
     try:
-        while True:
-            try:
-                # 接收并解析消息
+        await websocket.send_json(error_message)
+    except (WebSocketDisconnect, RuntimeError):
+        logging.warning("连接已关闭，错误消息发送失败。")
+
+
+def _message_id(message: Any) -> str:
+    if isinstance(message, dict) and isinstance(message.get("message_id"), str):
+        return message["message_id"]
+    return ""
+
+
+def _validation_detail(message: Any) -> str | None:
+    """Return a validation error description, or ``None`` when valid."""
+
+    if not isinstance(message, dict):
+        return "WebSocket 消息必须是 JSON 对象"
+    if "type" not in message:
+        return "缺少顶层字段 type"
+    if not isinstance(message.get("message_id"), str) or not message["message_id"]:
+        return "缺少或无效的顶层字段 message_id"
+    if "payload" not in message:
+        return "缺少顶层字段 payload"
+    if not isinstance(message["payload"], dict):
+        return "顶层字段 payload 必须是 JSON 对象"
+    return None
+
+
+async def websocket_chat(websocket: WebSocket) -> None:
+    """Serve one client while keeping protocol state local to its connection."""
+
+    await websocket.accept()
+    buffered_message: dict[str, Any] | None = None
+
+    while True:
+        message: Any = None
+        try:
+            if buffered_message is None:
                 raw_data = await websocket.receive_text()
                 try:
                     message = json.loads(raw_data)
-                except json.JSONDecodeError as e:
-                    await send_error(websocket, "JSON_PARSE_ERROR", str(e))
+                except json.JSONDecodeError as exc:
+                    await send_error(websocket, "JSON_PARSE_ERROR", str(exc))
                     continue
+            else:
+                message = buffered_message
+                buffered_message = None
 
-                # 基础验证
-                if message['type'] != 'client_query':
-                    await send_error(websocket, "INVALID_MSG_TYPE", f"Invalid Message Type: {message['type']}")
-                    continue
+            message_id = _message_id(message)
+            detail = _validation_detail(message)
+            if detail is not None:
+                await send_error(
+                    websocket,
+                    "VALIDATION_ERROR",
+                    detail,
+                    message_id=message_id,
+                )
+                continue
 
-                # 执行处理逻辑
-                try:
-                    client_request = ClientRequest(**message['payload'])
-                except ValueError as e:
-                    await send_error(websocket, "VALIDATION_ERROR", str(e))
-                    continue
-                try:
-                    resp = process_query(client_request)
-                except Exception as e:
-                    logging.error(f'处理查询失败: {str(e)}')
-                    await send_error(websocket, "PROCESS_ERROR", f"处理失败: {str(e)}")
+            if message["type"] != "client_query":
+                await send_error(
+                    websocket,
+                    "INVALID_MSG_TYPE",
+                    f"Invalid Message Type: {message['type']}",
+                    message_id=message_id,
+                )
+                continue
 
-                # 构造返回消息
-                respond_msg = {
-                    "type": "assistant_response",
-                    "message_id": message['message_id'],
-                    "status": "success",
-                    "payload": {
-                        "response": resp.response,
-                        "emotion": resp.emotion,
-                        "index": resp.index,
-                        "metrics":{
-                            "time_cost": resp.metrics['time_cost'],
-                            "tokens_used": resp.metrics['tokens_used'],
-                        },
-                        "imageUrl": resp.imageUrl
-                    },
-                }
-                try:
-                    await websocket.send_json(respond_msg)
-                    if websocket.client_state == WebSocketState.CONNECTED:
-                        print(f"[发送成功]，消息ID: {message['message_id']}，类型为: {respond_msg['type']}")
-                    else:
-                        print("消息已发送，但未经确认")
-                        continue
-                except Exception as e:
-                    print(f'消息发送出错: {str(e)}')
-                try:
-                    ack = await asyncio.wait_for(websocket.receive_json(), timeout = 30)
-                    if ack.get('message_id') == respond_msg['message_id']:
-                        print(f"[确认送达] 消息ID: {respond_msg['message_id']}")
-                    else:
-                        print("ACK不匹配")
+            try:
+                client_request = ClientRequest(**message["payload"])
+            except (ValidationError, TypeError, ValueError) as exc:
+                await send_error(
+                    websocket,
+                    "VALIDATION_ERROR",
+                    str(exc),
+                    message_id=message_id,
+                )
+                continue
 
-                except asyncio.TimeoutError:
-                    print("[未收到ACK] 消息可能没有送达")
+            try:
+                response = process_query(client_request)
+            except Exception as exc:  # orchestration failures become protocol errors
+                logging.exception("处理查询失败")
+                await send_error(
+                    websocket,
+                    "PROCESS_ERROR",
+                    str(exc),
+                    message_id=message_id,
+                )
+                continue
 
-            except WebSocketDisconnect as e:
-                print('客户端断开连接', e)
-                break
-    except WebSocketDisconnect as e:
-        print("连接断开", e)
-    except Exception as e:
-        logging.exception("WebSocket Fetal Error.")
-        await send_error(websocket, "SERVER_ERROR", str(e))
-    # finally:
-    #     # 关闭连接，清理缓存
-    #     await websocket.close()
+            response_message = {
+                "type": "assistant_response",
+                "message_id": message_id,
+                "status": "success",
+                "payload": {
+                    "response": response.response,
+                    "emotion": response.emotion,
+                    "index": response.index,
+                    "metrics": response.metrics,
+                    "imageUrl": response.imageUrl,
+                },
+            }
+            await websocket.send_json(response_message)
 
-async def send_error(websocket: WebSocket, code: str, detail: str = None):
-    # 有一个值得考虑的问题，此处没有附带msg_id，虽然是因为解析错误导致没有可以获取的message_id...
-    # 但是这样，前端要怎么知道是哪条信息解析出错了呢？
-    error_msg = {
-        "type": "error",
-        "code": code,
-        "message": "内部服务器出错。" if code == "SERVER_ERROR" else "请求格式出错。"
-        # 错误类型后续最好整理一下，暂时考虑的只有这两种。
-    }
+            try:
+                ack_raw = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=ACK_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                logging.info("[ACK 超时] 消息 ID: %s", message_id)
+                continue
 
-    #   "type": "error",                            // 消息类型标识符，这一个类型消息指向传输错误；
-    #   "message_id": "session_1234",               // 消息ID，从前端传过来的ID和从后端反馈的ID必须要对应一样。
-    #   "code": "AUTH_403",                         // 错误代码，指向此次错误的类型。
-    #   "message": "无效的音色ID配置",                 // 错误信息，具体描述错误代码的含义
-    #   "detail": "voice_id=vivi-3 不存在于配置库"     // 错误详情，指出此次错误的具体原因，便于调试错误。
+            try:
+                ack_or_message = json.loads(ack_raw)
+            except json.JSONDecodeError as exc:
+                await send_error(websocket, "JSON_PARSE_ERROR", str(exc))
+                continue
 
-    if detail:
-        error_msg["detail"] = detail
-    try:
-        await websocket.send_json(error_msg)
-    except ConnectionClosedError:
-        logging.warning("连接已关闭，消息发送失败。")
+            # A new query can arrive before the ACK. Preserve it for the next
+            # loop iteration instead of consuming it as a mismatched ACK.
+            if (
+                isinstance(ack_or_message, dict)
+                and ack_or_message.get("type") == "client_query"
+            ):
+                buffered_message = ack_or_message
+            elif (
+                isinstance(ack_or_message, dict)
+                and ack_or_message.get("message_id") == message_id
+            ):
+                logging.info("[ACK 已确认] 消息 ID: %s", message_id)
+            else:
+                logging.warning("[ACK 不匹配] 消息 ID: %s", message_id)
+
+        except WebSocketDisconnect:
+            logging.info("客户端断开连接")
+            break
+        except Exception as exc:
+            logging.exception("WebSocket 处理异常")
+            await send_error(
+                websocket,
+                "SERVER_ERROR",
+                str(exc),
+                message_id=_message_id(message),
+            )
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host = "0.0.0.0", port = 8000, reload = True)
-    # import uvloop
-    # uvloop.install()
+
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

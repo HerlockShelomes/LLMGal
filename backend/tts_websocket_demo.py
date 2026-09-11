@@ -9,6 +9,7 @@ pip install websockets
 '''
 
 import asyncio
+import os
 import websockets
 import uuid
 import json
@@ -21,8 +22,8 @@ MESSAGE_TYPE_SPECIFIC_FLAGS = {0: "no sequence number", 1: "sequence number > 0"
 MESSAGE_SERIALIZATION_METHODS = {0: "no serialization", 1: "JSON", 15: "custom type"}
 MESSAGE_COMPRESSIONS = {0: "no compression", 1: "gzip", 15: "custom compression method"}
 
-appid = "7535590105"
-token = "_SRNKZhKXevBrx72wklF-D8NX7LGigGs"
+appid = os.getenv("LLMGAL_TTS_APP_ID", "")
+token = os.getenv("LLMGAL_TTS_TOKEN", "")
 cluster = "volcano_tts"
 voice_type = "zh_female_shuangkuaisisi_emo_v2_mars_bigtts"
 host = "openspeech.bytedance.com"
@@ -84,7 +85,7 @@ async def test_submit():
     print("request json: ", submit_request_json)
     print("\nrequest bytes: ", full_client_request)
     file_to_save = open(f"{reqid}_Stream.mp3", "wb")
-    async with websockets.connect(api_url, additional_headers={"Authorization": "Bearer; _SRNKZhKXevBrx72wklF-D8NX7LGigGs"}, ping_interval=None) as ws:
+    async with websockets.connect(api_url, additional_headers={"Authorization": f"Bearer; {token}"}, ping_interval=None) as ws:
         await ws.send(full_client_request)
         while True:
             res = await ws.recv()

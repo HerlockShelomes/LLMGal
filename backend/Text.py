@@ -1,4 +1,14 @@
-from openai import OpenAI
+"""Role prompt loading and OpenAI-compatible text generation."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+ROLES_DIR = REPOSITORY_ROOT / "frontend" / "src" / "assets" / "roles"
 
 Emotion_Prompt = """
 
@@ -8,55 +18,52 @@ Emotion_Prompt = """
 例如: (高兴)(因为受到了朋友的邀请)。请注意使用英语括号。
 消息整体不得超过150字"""
 
-def get_role_prompt(role_name):
-    role_prompt = ""
+
+def get_role_prompt(role_name: str) -> str:
+    """Read a role prompt and append the fixed emotion-format instruction."""
+
+    prompt_path = Path(ROLES_DIR) / f"{role_name}.txt"
     try:
-        with open(f'../frontend/src/assets/roles/{role_name}.txt', 'r', encoding='utf-8') as file:
-            role_prompt = file.read()
-            role_prompt = "".join([role_prompt, Emotion_Prompt])
-            print(role_prompt)
-    except FileNotFoundError:
-        print("文件未找到，请检查文件路径。")
-    except IOError:
-        print("发生IO错误，无法读取文件。")
+        role_prompt = prompt_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return ""
+    return role_prompt + Emotion_Prompt
 
-    return role_prompt
 
-def get_llm_response(model, role, prompt):
-    """
-    :param model: 指定选择的模型名称，目前可以支持大部分文本模型，只是更换名称的区别而已。
-    :param role: 指定的角色名称
-    :param prompt: 用户输入的文本，驱动大语言模型给予回复。
-    :return: 大语言模型生成的回复。
-    """
-    answer_content = ""
-    role_pro = get_role_prompt(role)
-    full_prompt = [{"role": "assistant", "content": role_pro}]
-    full_prompt.append(prompt)
-    print(full_prompt)
+def _create_client():
+    """Create the real client only when production code actually needs it."""
 
-    client = OpenAI(api_key= 'sk-Tk2Rpty6GBWzDx16Cf7f1e2b5a2f425eA5CbA91958A36d16', base_url="https://o3.fan/v1")
-    completion = client.chat.completions.create(
+    from openai import OpenAI
+
+    api_key = os.getenv("LLMGAL_LLM_API_KEY")
+    base_url = os.getenv("LLMGAL_LLM_BASE_URL")
+    if not api_key:
+        raise RuntimeError("缺少环境变量 LLMGAL_LLM_API_KEY")
+    kwargs: dict[str, str] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return OpenAI(**kwargs)
+
+
+def get_llm_response(model: str, role: str, prompt: dict[str, Any]) -> str:
+    """Stream one response from the configured OpenAI-compatible service."""
+
+    role_prompt = get_role_prompt(role)
+    messages: list[dict[str, Any]] = [
+        {"role": "assistant", "content": role_prompt},
+        prompt,
+    ]
+    completion = _create_client().chat.completions.create(
         model=model,
         stream=True,
-        messages=full_prompt
+        messages=messages,
     )
 
+    answer_parts: list[str] = []
     for chunk in completion:
-        # 如果chunk.choices为空，则打印usage
         if not chunk.choices:
-            print("\nUsage:")
-            print(chunk.usage)
-        else:
-            delta = chunk.choices[0].delta
-            # 打印思考过程
-                # 开始回复
-            if delta.content != "":
-            # 打印回复过程
-                print(delta.content, end='', flush=True)
-                answer_content += delta.content
-    return answer_content
-
-if __name__ == '__main__':
-    answer = ""
-    answer = get_llm_response("deepseek-ai/DeepSeek-V3", "Testificate", {"role": "user", "content": "有时间一块桌游吗？"})
+            continue
+        content = chunk.choices[0].delta.content
+        if content:
+            answer_parts.append(content)
+    return "".join(answer_parts)

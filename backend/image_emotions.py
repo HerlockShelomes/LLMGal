@@ -1,8 +1,9 @@
 from __future__ import print_function
+import os
 from volcengine.visual.VisualService import VisualService
 # 你的密钥信息
-ACCESS = 'AKLTODlhZDdkMzc3OTU3NGE3Zjk2NWIwODlkNDY2ZDQ1Y2I'
-SECRET = 'T1RrME1HRTFaVFppWkRNMk5EUTJZMkUwTURnMllUUmhNelZoT1dSa01UZw=='
+ACCESS = os.getenv("LLMGAL_IMAGE_ACCESS_KEY", "")
+SECRET = os.getenv("LLMGAL_IMAGE_SECRET_KEY", "")
 prompt = """
 Maintain the image style as well as all the features of the girl in this image, and keep the background white,
 but alter her facial experssions so that she looks happy because she likes spending time with you.
