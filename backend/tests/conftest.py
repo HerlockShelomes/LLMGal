@@ -4,6 +4,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
@@ -35,3 +37,13 @@ except ModuleNotFoundError:
     sys.modules["volcengine"] = volcengine_stub
     sys.modules["volcengine.visual"] = visual_stub
     sys.modules["volcengine.visual.VisualService"] = visual_service_stub
+
+
+@pytest.fixture(autouse=True)
+def block_unmocked_http(monkeypatch):
+    """Fail immediately if a test accidentally reaches the real network."""
+
+    def blocked(*_args, **_kwargs):
+        raise AssertionError("模块一测试禁止访问真实网络")
+
+    monkeypatch.setattr("requests.sessions.Session.request", blocked)

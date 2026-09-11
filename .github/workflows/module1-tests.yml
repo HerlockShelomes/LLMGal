@@ -1,0 +1,43 @@
+name: Module 1 automated tests
+
+on:
+  push:
+    branches: [main, codex/module1-testing]
+    paths:
+      - "backend/**"
+      - "scripts/run_module1_tests.sh"
+      - ".github/workflows/module1-tests.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "scripts/run_module1_tests.sh"
+      - ".github/workflows/module1-tests.yml"
+  workflow_dispatch:
+
+jobs:
+  module1-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run isolated test suite
+        env:
+          LLMGAL_TEST_PYTHON: python
+        run: ./scripts/run_module1_tests.sh -q
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: module1-test-results
+          path: artifacts/test-results/
+          if-no-files-found: warn
+          retention-days: 30
