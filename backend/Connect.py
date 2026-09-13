@@ -213,6 +213,9 @@ def health_check():
 async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
     try:
+        # 待确认的响应ID。发送响应后记录，下一条消息若是它的回执才消费，
+        # 不是回执就按普通业务请求处理，避免把用户请求当成 ACK 吞掉。
+        pending_ack_id = None
         while True:
             try:
                 # 接收并解析消息
@@ -223,22 +226,52 @@ async def websocket_chat(websocket: WebSocket):
                     await send_error(websocket, "JSON_PARSE_ERROR", str(e))
                     continue
 
+                # 先判定是否为上一条响应的确认回执。
+                # 仅当 message_id 与待确认ID一致、且不是新的业务请求时才消费掉；
+                # 否则继续按业务请求处理，避免下一条提问被误当成 ACK 吞掉。
+                if (
+                    pending_ack_id is not None
+                    and message.get('message_id') == pending_ack_id
+                    and message.get('type') != 'client_query'
+                ):
+                    print(f"[确认送达] 消息ID: {pending_ack_id}")
+                    pending_ack_id = None
+                    continue
+
                 # 基础验证
                 if message['type'] != 'client_query':
-                    await send_error(websocket, "INVALID_MSG_TYPE", f"Invalid Message Type: {message['type']}")
+                    await send_error(
+                        websocket,
+                        "INVALID_MSG_TYPE",
+                        f"Invalid Message Type: {message['type']}",
+                        message_id=message.get('message_id', ''),
+                    )
                     continue
 
                 # 执行处理逻辑
                 try:
                     client_request = ClientRequest(**message['payload'])
                 except ValueError as e:
-                    await send_error(websocket, "VALIDATION_ERROR", str(e))
+                    await send_error(
+                        websocket,
+                        "VALIDATION_ERROR",
+                        str(e),
+                        message_id=message.get('message_id', ''),
+                    )
                     continue
                 try:
                     resp = process_query(client_request)
                 except Exception as e:
                     logging.error(f'处理查询失败: {str(e)}')
-                    await send_error(websocket, "PROCESS_ERROR", f"处理失败: {str(e)}")
+                    await send_error(
+                        websocket,
+                        "PROCESS_ERROR",
+                        f"处理失败: {str(e)}",
+                        message_id=message.get('message_id', ''),
+                    )
+                    # 处理失败时必须跳出本轮循环，否则 resp 未绑定，
+                    # 下面构造响应消息会再抛 NameError，导致一次失败连发两条错误响应。
+                    continue
 
                 # 构造返回消息
                 respond_msg = {
@@ -265,15 +298,10 @@ async def websocket_chat(websocket: WebSocket):
                         continue
                 except Exception as e:
                     print(f'消息发送出错: {str(e)}')
-                try:
-                    ack = await asyncio.wait_for(websocket.receive_json(), timeout = 30)
-                    if ack.get('message_id') == respond_msg['message_id']:
-                        print(f"[确认送达] 消息ID: {respond_msg['message_id']}")
-                    else:
-                        print("ACK不匹配")
-
-                except asyncio.TimeoutError:
-                    print("[未收到ACK] 消息可能没有送达")
+                # 只登记待确认的响应ID，不再阻塞式等待下一条消息。
+                # 原先在此处直接 receive_json() 会把用户紧接着发来的下一条业务
+                # 请求误当成 ACK 消费掉且不重放，导致该请求被永久丢弃。
+                pending_ack_id = respond_msg['message_id']
 
             except WebSocketDisconnect as e:
                 print('客户端断开连接', e)
@@ -287,14 +315,26 @@ async def websocket_chat(websocket: WebSocket):
     #     # 关闭连接，清理缓存
     #     await websocket.close()
 
-async def send_error(websocket: WebSocket, code: str, detail: str = None):
-    # 有一个值得考虑的问题，此处没有附带msg_id，虽然是因为解析错误导致没有可以获取的message_id...
-    # 但是这样，前端要怎么知道是哪条信息解析出错了呢？
+async def send_error(websocket: WebSocket, code: str, detail: str = None, message_id: str = ""):
+    """回传错误消息。
+
+    必须携带 message_id 与 payload：前端的 isServerMessage 会校验
+    type / message_id / payload 三项，缺任一项都会被判为非法消息并丢弃，
+    错误提示根本无法到达用户。顶层同时保留 code/message/detail 以兼容既有消费者。
+    """
+    text = "内部服务器出错。" if code == "SERVER_ERROR" else "请求格式出错。"
     error_msg = {
         "type": "error",
+        "message_id": message_id,
+        "status": "error",
         "code": code,
-        "message": "内部服务器出错。" if code == "SERVER_ERROR" else "请求格式出错。"
+        "message": text,
         # 错误类型后续最好整理一下，暂时考虑的只有这两种。
+        "payload": {
+            "code": code,
+            "message": text,
+            "detail": detail or "",
+        },
     }
 
     #   "type": "error",                            // 消息类型标识符，这一个类型消息指向传输错误；

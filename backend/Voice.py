@@ -190,9 +190,18 @@ async def Voice_Generation (role, voiType, emoType, text, i):
 
 def save_audio_from_base64(audio: str, role, index) -> str:
     try:
+        # 合法 Base64 允许按 76 字符折行（RFC 2045），先剥离空白再严格校验，
+        # 避免合法换行被 validate 判定为非法字符。
+        audio_payload = "".join(audio.split())
+        # validate=True：遇到非法字符（如 "%"）抛 binascii.Error，
+        # 而不是像默认的 validate=False 那样静默丢弃后解出空字节并照常落盘。
+        audio_data = base64.b64decode(audio_payload, validate=True)
+        if not audio_data:
+            print("音频数据为空，跳过保存")
+            return ""
+
         savePath = f"../frontend/src/assets/voice/{role}/{role}_{index}_Stream.mp3"
         os.makedirs(os.path.dirname(savePath), exist_ok=True)
-        audio_data = base64.b64decode(audio)
         with open(savePath, 'wb') as audio_file:
             audio_file.write(audio_data)
 

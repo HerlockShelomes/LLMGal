@@ -452,6 +452,18 @@ const handleConnectionEvents = () => {
   });
 
   websocketManager.on('message', handleServerMessage);
+
+  // 兜底：若后端回传的消息缺少 message_id / payload，WebSocketManager 会判为
+  // invalid_message。此前没有注册该事件，这类消息会被静默丢弃，无从察觉。
+  websocketManager.on('invalid_message', (data) => {
+    console.warn('收到不符合 server-message 契约的消息，已忽略：', data);
+    receives.value.push({
+      id: "Event Detected: Invalid Message",
+      sender: "system",
+      state: "Invalid Message",
+    });
+  });
+
   console.log('监听器已注册');
 };
 

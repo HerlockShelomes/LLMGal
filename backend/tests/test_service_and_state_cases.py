@@ -203,7 +203,6 @@ def test_tc_tts_02_timeout_returns_empty_and_flow_continues(monkeypatch, tmp_pat
     assert "index:4" in records.read_text(encoding="utf-8")
 
 
-@pytest.mark.xfail(strict=True, reason="TC-TTS-04：当前实现会写入零字节音频")
 def test_tc_tts_04_invalid_base64_must_not_create_audio(monkeypatch, tmp_path):
     """TC-TTS-04：非法 Base64 应返回空串且不创建有效 mp3。"""
     assets, _records = make_workspace(monkeypatch, tmp_path)
@@ -342,8 +341,8 @@ def test_tc_res_02_index_nine_wraps_to_zero(monkeypatch, tmp_path):
     assert "index:0" in records.read_text(encoding="utf-8")
 
 
-def test_tc_res_03_missing_records_falls_back_then_write_fails(monkeypatch, tmp_path):
-    """TC-RES-03：Records 缺失时先静态降级，随后更新记录失败。"""
+def test_tc_res_03_missing_records_falls_back_then_write_succeeds(monkeypatch, tmp_path):
+    """TC-RES-03：Records 缺失时静态降级，并在写回阶段自动初始化记录。"""
     backend_dir = tmp_path / "backend"
     backend_dir.mkdir()
     monkeypatch.chdir(backend_dir)
@@ -362,26 +361,41 @@ def test_tc_res_03_missing_records_falls_back_then_write_fails(monkeypatch, tmp_
     monkeypatch.setattr(
         Integration, "emotional_bro", lambda *args: realtime_calls.append(args)
     )
-    with pytest.raises(FileNotFoundError):
-        call_collection(realtime=True)
+    # 修复后：不再因为 Records 缺失而在写回阶段抛 FileNotFoundError。
+    call_collection(realtime=True)
     assert voice_calls[0][4] == "0"
     assert static_calls == [("Wendy", "mock-image")]
     assert realtime_calls == []
+    records = tmp_path / "frontend" / "src" / "assets" / "Records.txt"
+    assert records.exists()
+    assert "Wendy:" in records.read_text(encoding="utf-8")
+    assert "index:1" in records.read_text(encoding="utf-8")
 
 
-def test_tc_ex_01_missing_role_record_fails_before_external_calls(monkeypatch, tmp_path):
-    """TC-EX-01：角色记录缺失时 matches[0] 抛异常且未调用外部服务。"""
+def test_tc_ex_01_missing_role_record_falls_back_without_crash(monkeypatch, tmp_path):
+    """TC-EX-01：角色记录缺失时受控降级为静态模式，不抛未受控异常。"""
     make_workspace(monkeypatch, tmp_path, role="Other")
     calls = []
+    static_calls = []
     monkeypatch.setattr(
-        Integration, "get_llm_response", lambda *_args: calls.append("llm")
+        Integration,
+        "get_llm_response",
+        lambda *_args: calls.append("llm") or FIXED_REPLY,
     )
-    with pytest.raises(IndexError):
-        call_collection()
-    assert calls == []
+    monkeypatch.setattr(Integration, "Voice_Generation_through_http", lambda *_args: "")
+    monkeypatch.setattr(
+        Integration,
+        "static_images",
+        lambda *args: static_calls.append(args) or "static-url",
+    )
+    # 修复后：角色记录缺失时走与文件缺失相同的降级路径，外部调用照常进行。
+    result = call_collection()
+    assert calls == ["llm"]
+    assert static_calls == [("Wendy", "mock-image")]
+    assert result[1] == "0"
+    assert result[3] == "static-url"
 
 
-@pytest.mark.xfail(strict=True, reason="TC-EX-02：正则表达式先排除了非数字索引")
 def test_tc_ex_02_nonnumeric_index_fails_after_external_side_effects(monkeypatch, tmp_path):
     """TC-EX-02：按清单预期，非数字索引应在外部副作用之后转换失败。"""
     _assets, records = make_workspace(monkeypatch, tmp_path)
@@ -403,8 +417,8 @@ def test_tc_ex_02_nonnumeric_index_fails_after_external_side_effects(monkeypatch
     assert calls == ["llm", "tts"]
 
 
-def test_tc_con_01_concurrent_requests_share_same_slot(monkeypatch, tmp_path):
-    """TC-CON-01：强制并发交错，验证两个请求读取并使用同一资源槽。"""
+def test_tc_con_01_concurrent_requests_use_distinct_slots(monkeypatch, tmp_path):
+    """TC-CON-01：强制并发交错，验证两个请求被分配到互不相同的资源槽。"""
     make_workspace(monkeypatch, tmp_path, index="3")
     barrier = Barrier(2)
     voice_slots = []
@@ -428,6 +442,7 @@ def test_tc_con_01_concurrent_requests_share_same_slot(monkeypatch, tmp_path):
     )
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _item: call_collection(), range(2)))
-    assert voice_slots == ["3", "3"]
-    assert [result[1] for result in results] == ["3", "3"]
-    assert updates == [("Wendy", "", "4"), ("Wendy", "", "4")]
+    # 修复后：两个并发请求在锁内依次推进槽位，拿到 3 与 4 两个不同槽。
+    assert sorted(voice_slots) == ["3", "4"]
+    assert sorted(result[1] for result in results) == ["3", "4"]
+    assert sorted(item[2] for item in updates) == ["4", "5"]
