@@ -5,19 +5,19 @@ type EventHandler<in T=unknown> = (data: T) => void;
 export class WebSocketManager {
     private socket: WebSocket | null = null;
     private handlers: Map<string, Set<EventHandler<unknown>>> = new Map();
+    //on() 注册进 handlers 的是 wrapper，off() 若重新 new 一个 wrapper 就永远删不掉监听器。
+    //因此按 event -> (原始 handler -> wrapper) 缓存引用，off() 时取出同一个 wrapper 再 delete。
+    private wrappers: Map<string, Map<EventHandler<unknown>, EventHandler<unknown>>> = new Map();
     private reconnectAttempts = 0;
     private readonly maxRetries = 3;
     private heartbeatInterval: number | null = null;
     private lastHeartbeat = 0;
+    //主动 disconnect 时置位，避免 close 事件被当成异常断开来处理
+    private manualClose = false;
 
-    // private listeners: Record<string, Function[]> = {
-    //     message: [],
-    //     open: [],
-    //     close: [],
-    //     error: [],
-    //     invalid_message: [],
-    //     parse_error: [],
-    // };
+    //心跳周期与判死阈值：周期必须小于阈值，否则永远等不到服务端回包就自我重连
+    private readonly heartbeatPeriod = 30_000;
+    private readonly heartbeatTimeout = 90_000;
 
 
     /*
@@ -37,19 +37,17 @@ export class WebSocketManager {
                 return;
             }
 
+            this.manualClose = false;
             this.socket = new WebSocket(this.url);
 
             this.socket?.addEventListener('open', (event) => {
-                console.log('连接已建立');
                 this.reconnectAttempts = 0;
-                //this.startHeartbeat();
+                this.startHeartbeat();
                 this.emit('connected', event);
-                console.log('这段文字代表连接成功')
                 resolve();
             })
 
             this.socket?.addEventListener('error', (error) => {
-                console.log("你改悔罢")
                 this.emit('error', error);
                 reject(error);
             })
@@ -57,16 +55,16 @@ export class WebSocketManager {
             this.socket?.addEventListener('message', this.handleMessage.bind(this));
 
             this.socket?.addEventListener('close', (event) => {
+                //断开时必须停掉心跳，否则定时器会一直持有已失效的 socket
+                this.stopHeartbeat();
 
-                if (!event.wasClean && this.reconnectAttempts < this.maxRetries) {
+                if (!this.manualClose && !event.wasClean && this.reconnectAttempts < this.maxRetries) {
                     setTimeout(() => {
                         console.log(`尝试重连：${this.reconnectAttempts + 1}/${this.maxRetries}`);
                         this.reconnectAttempts++;
                         this.connect().catch(reject);
                     }, 1000 * this.reconnectAttempts);
                 } else {
-                    console.log('不干了')
-                    //this.stopHeartbeat();
                     this.emit('disconnected', event);
                     reject(new Error("Connection Closed"));
                 }
@@ -80,13 +78,22 @@ export class WebSocketManager {
     }
 
     private handleMessage = (event: MessageEvent) => {
-        console.log("[WebSocket] 原始消息接收:", event.data);
+        //任何服务端报文都证明链路还活着
+        this.lastHeartbeat = Date.now();
         try {
             const data = JSON.parse(event.data);
-            console.log("[WebSocket] 解析后的消息:", data);
 
-            if (data.type === 'heartbeat') {
-                this.lastHeartbeat = Date.now();
+            // 后端对心跳回的是 pong（Connect.py），而 pong 不在 ServerMessageType 里。
+            // 漏在这里就会被下面的 isServerMessage 判成非法消息，
+            // 结果每 30 秒弹一次「请求被后端拒绝：未知原因」。
+            if (data.type === 'heartbeat' || data.type === 'pong') {
+                return;
+            }
+
+            //invalid_message 不带 status，过不了 isServerMessage，
+            //必须单独识别，否则会被当成"未知消息"静默丢弃。
+            if (data.type === 'invalid_message') {
+                this.emit("invalid_message", data);
                 return;
             }
 
@@ -110,22 +117,27 @@ export class WebSocketManager {
     }
 
     public on<T>(event: string, handler: EventHandler<T>): void {
-        console.log(`[事件系统] 注册监听器: ${event}`);
         const wrapper: EventHandler<unknown> = data => handler(data as T);
         if (!this.handlers.has(event)) {
             this.handlers.set(event, new Set());
         }
         this.handlers.get(event)?.add(wrapper);
 
+        if (!this.wrappers.has(event)) {
+            this.wrappers.set(event, new Map());
+        }
+        this.wrappers.get(event)?.set(handler as EventHandler<unknown>, wrapper);
     }
 
     public off<T>(event: string, handler: EventHandler<T>): void {
-        const wrapper: EventHandler<unknown> = data => handler(data as T);
+        const wrapper = this.wrappers.get(event)?.get(handler as EventHandler<unknown>);
+        if (!wrapper) return;
+
         this.handlers.get(event)?.delete(wrapper);
+        this.wrappers.get(event)?.delete(handler as EventHandler<unknown>);
     }
 
     private handleServerMessage(message: AnyServerMessage): void {
-        console.log("Message Received and Parsed");
         switch (message.type) {
             case "assistant_response":
                 this.emit("message", message);
@@ -142,23 +154,27 @@ export class WebSocketManager {
     }
 
     public emit<T>(event: string, data?: T extends infer D?D: never): void {
-        console.log(`[事件系统] 触发事件: ${event}`, data);
+        //无条件回调：像 disconnected 这类不带数据的事件，
+        //若要求 data !== undefined 就永远不会触发。
         this.handlers.get(event)?.forEach(handler => {
-            if (typeof data !== 'undefined') {
-                handler(data);
-            }
+            handler(data);
         });
     }
 
     public disconnect(): void {
+        this.manualClose = true;
+        this.stopHeartbeat();
         this.socket?.close();
+        this.socket = null;
         this.handlers.clear();
+        this.wrappers.clear();
     }
 
     private startHeartbeat() {
+        this.stopHeartbeat();
         this.lastHeartbeat =  Date.now();
         this.heartbeatInterval = window.setInterval(() => {
-            if (Date.now() - this.lastHeartbeat > 30000) {
+            if (Date.now() - this.lastHeartbeat > this.heartbeatTimeout) {
                 console.log('心不跳力，现在重连');
                 this.reconnect();
                 return;
@@ -168,7 +184,7 @@ export class WebSocketManager {
             if (this.socket?.readyState === WebSocket.OPEN) {
                 this.socket.send(JSON.stringify({type: 'heartbeat', timestamp: Date.now()}));
             }
-        }, 1000) as unknown as number;
+        }, this.heartbeatPeriod) as unknown as number;
     }
 
     private stopHeartbeat() {
@@ -182,6 +198,8 @@ export class WebSocketManager {
         if (this.socket) {
             this.socket.close(1000, 'reconnecting');
         }
-        this.connect();
+        this.connect().catch(error => {
+            console.error('重连失败: ', error);
+        });
     }
 }

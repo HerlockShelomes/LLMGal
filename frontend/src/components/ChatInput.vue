@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import {ref, computed, watch} from 'vue'
+import {ref, computed, watch, onBeforeUnmount} from 'vue'
 import { Delete, Position, Upload, Plus, Document, VideoPlay } from '@element-plus/icons-vue'
 import { useChatStore } from '../stores/chat.ts'
 import { ElInput, ElMessage, ElMessageBox } from 'element-plus'
 import {
   useSettingsStore,
+  getImageUrl,
 } from '../stores/settings.ts'
 
 // 定义组件的属性
@@ -38,10 +39,8 @@ const messageText = ref('')
 const placeholder = `输入消息，按Enter发送
 Shift + Enter 换行`
 
-const getImageUrl = (name: string, index: string) => {
-  // 使用vite静态资源处理
-  return new URL(`/src/assets/pictures/${name}/${name}_${index}.jpg`, import.meta.url).href
-}
+// 角色立绘：资源缺失时 getImageUrl 返回空串，v-if 才有意义
+const roleImageUrl = computed(() => getImageUrl(settings.RoleConfig.roleName, i.value))
 
 //要求这一部分跟随消息变换。
 const i = ref<string>("neutral")
@@ -73,7 +72,8 @@ const handleFileChange = (file: { raw: File }) => {
 
 // 移除文件
 const removeFile = (index: number) => {
-  selectedFiles.value.splice(index, 1)
+  const [removed] = selectedFiles.value.splice(index, 1)
+  if (removed) releasePreviewUrl(removed)
 }
 
 // 判断是否为图片文件
@@ -81,9 +81,29 @@ const isImage = (file: File) => {
   return file.type.startsWith('image/')
 }
 
+// 预览 URL 缓存：createObjectURL 返回的句柄不会被自动回收，
+// 每次渲染都新建会让文件内存一直堆积到页面刷新，必须缓存并显式 revoke。
+const previewUrlCache = new WeakMap<File, string>()
+
 // 获取预览URL
-const getPreviewUrl = (file: File) => {
-  return URL.createObjectURL(file)
+const getPreviewUrl = (file: File): string => {
+  const cached = previewUrlCache.get(file)
+  if (cached) return cached
+
+  const url = URL.createObjectURL(file)
+  previewUrlCache.set(file, url)
+  return url
+}
+
+const releasePreviewUrl = (file: File) => {
+  const url = previewUrlCache.get(file)
+  if (!url) return
+  URL.revokeObjectURL(url)
+  previewUrlCache.delete(file)
+}
+
+const releaseAllPreviewUrls = () => {
+  selectedFiles.value.forEach(releasePreviewUrl)
 }
 
 // 修改发送处理函数
@@ -110,6 +130,7 @@ const handleSend = async () => {
 
     emit('send', content)
     messageText.value = ''
+    releaseAllPreviewUrls()
     selectedFiles.value = []
     showUpload.value = false
   } catch (error) {
@@ -179,10 +200,21 @@ const adjustHeight = () => {
   }
 }
 
+// 回车发送：输入法组合态下的回车用于确认候选词，不能当成发送
+const handleEnterKeydown = (event: Event) => {
+  const keyboardEvent = event as KeyboardEvent
+  if (keyboardEvent.isComposing) return
+  keyboardEvent.preventDefault()
+  handleSend()
+}
+
 // 添加暂停处理函数
 const handleStop = () => {
   emit('stop')
 }
+
+// 组件卸载时释放所有预览 URL，避免文件句柄泄漏
+onBeforeUnmount(releaseAllPreviewUrls)
 </script>
 
 <template>
@@ -220,13 +252,13 @@ const handleStop = () => {
 
       <div class="image-preview">
         <!---此处的index调用需要进行调用逻辑的修改，记得及时完成--->
-        <img :src= "getImageUrl(settings.RoleConfig.roleName, i)" alt = "Role">
-        <span v-if= "!getImageUrl(settings.RoleConfig.roleName, i)" class="place">+</span>
+        <img v-if="roleImageUrl" :src="roleImageUrl" alt="Role">
+        <span v-else class="place">+</span>
         <!---如果是引用放在public内的文件，就不需要目录回退。暂时原理并没特别理解，但至少要知道这一件事。--->
       </div>
 
       <el-input v-model="messageText" type="textarea" :rows="6" :autosize="{ minRows: 6, maxRows: 6 }"
-        :placeholder="placeholder" resize="none" @keydown.enter.exact.prevent="handleSend"
+        :placeholder="placeholder" resize="none" @keydown.enter.exact="handleEnterKeydown"
         @keydown.enter.shift.exact="newline" @input="adjustHeight" ref="inputRef" />
 
       <div class="button-group">

@@ -151,7 +151,9 @@ async def test_tc_ws_04_non_client_query_rejected_without_side_effect(monkeypatc
         Connect, "process_query", lambda request: calls.append(request) or fixed_response()
     )
     wrong = valid_message()
-    wrong["type"] = "canceled_request"
+    # 注意：canceled_request 已被后端作为控制帧处理（用户中止），
+    # 这里换一个真正未知的类型来验证"非法类型被拒绝且连接可复用"。
+    wrong["type"] = "unknown_message_type"
     websocket = await run_socket(
         [wrong, valid_message(), {"message_id": "msg-001"}], monkeypatch
     )

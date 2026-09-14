@@ -3,6 +3,7 @@ import re
 import threading
 import traceback
 
+import config
 from Text import get_llm_response
 from Voice import Voice_Generation_through_http
 from Image import emotional_bro
@@ -105,7 +106,9 @@ def request_confirmation(voice, emo):
             selected_emo_voice = "neutral"
             selected_emo_image = ["neutral", "calm with a smile on the face"]
         case '高兴':
-            selected_emo_voice = "neutral"
+            # 原先高兴/生气/惊喜/害羞四种情绪全被压成 neutral，
+            # 换再好的语音模型也表现不出来（等于白花钱升级）。
+            selected_emo_voice = "happy"
             selected_emo_image = ["happy", "happy to hear your response"]
         case '悲伤':
             selected_emo_voice = "sad"
@@ -114,13 +117,13 @@ def request_confirmation(voice, emo):
             selected_emo_voice = "fear"
             selected_emo_image = ["fear", "scared because you said something too scary"]
         case '生气':
-            selected_emo_voice = "neutral"
+            selected_emo_voice = "angry"
             selected_emo_image = ["angry", "angry because you said something too rude"]
         case '惊喜':
-            selected_emo_voice = "neutral"
+            selected_emo_voice = "surprised"
             selected_emo_image = ["surprised", "surprised because your response is quite unexpected"]
         case '害羞':
-            selected_emo_voice = "neutral"
+            selected_emo_voice = "shy"
             selected_emo_image = ["shy", "shy due to the truth that the person likes you as well, and cheeks are red"]
         case _:
             selected_emo_voice = "neutral"
@@ -149,7 +152,7 @@ def updateLinks(roleName, updatedUrl, updatedIndex):
     _write_records_lines(lines)
 
 
-def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGeneration, text):
+def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGeneration, text, history=None, sessionId=None):
     """
     现阶段设计下，模型应该只支持中文对话。后续应当如何更改提升泛化能力？
     :param textModel: 指示此次生成所使用的文本模型。
@@ -164,7 +167,11 @@ def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGene
     如果失败，就调用文生图模型生成新的形象。
     静态资源和实时生成资源需要区分开。
     :param text: 指示此次的用户输入提示词。
-    :return: 返回前端回复文本内容、对应调用的图片及语音资源文件位置，最近一次生成图片对应的url，同时跟踪的index值也必须反馈前端。
+    :param history: 可选，多轮历史消息（[{role, content}, ...]），用于让模型记住上下文。
+    :param sessionId: 可选，会话标识，便于日志追踪。
+    :return: (回复文本, 资源序号, 情绪标签, 本次新生成的图片 url, 处理状态)
+             状态为 success / partial：语音或图片任一失败即降级为 partial，
+             不再像缺陷 009 那样失败也谎报 success。
     """
 
     with _lock_for(roleName):
@@ -205,7 +212,9 @@ def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGene
             pass
     # index: 指示此次生成所对应的角色资源序号。（从0-9，超出9就复归0重新计数）
 
-    answer = get_llm_response(textModel, roleName, text)
+    # 项目此前零多轮记忆：只发当前这一句，模型窗口再大也用不上。
+    # 现在把前端传来的历史一并交给模型（清洗与长度限制在 Text.sanitize_history 内）。
+    answer = get_llm_response(textModel, roleName, text, history)
 
     pattern = r'\((.*?)\)'
     try:
@@ -228,7 +237,20 @@ def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGene
 
     voiceType, voiceEmotion, imageEmotion = request_confirmation(voiceName, emotion)
 
-    Voice_Generation_through_http(roleName, voiceType, voiceEmotion, answer, index)
+    # 角色音色优先：让每个角色的发音各不相同。
+    # 前端原先对所有角色都发同一个 voiceCate，四个角色说话一模一样；
+    # voiceCate 现在只作为角色未登记音色时的兜底。
+    voiceType = config.resolve_role_voice_volc(roleName, voiceType)
+
+    # 缺陷 009：TTS 失败时不能再谎报 success。这里记录结果并降级状态。
+    # 注意 N04：Voice 内部会剥掉开头的情绪括号，用户不会听到「（高兴）」被念出来。
+    voice_path = ""
+    try:
+        voice_path = Voice_Generation_through_http(roleName, voiceType, voiceEmotion, answer, index)
+    except Exception:
+        traceback.print_exc()
+        voice_path = ""
+    voice_ok = bool(voice_path)
     # 注意此处：role的名称尚未提取，可以使用正则表达式提取；
     # 此处更改了规范，以role的名称索引对应的角色提示词和形象生成词。
     # 角色提示词规范，后续还需要继续优化。
@@ -236,6 +258,7 @@ def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGene
     # 此处为了调用的一致性，index统一跟随音频index变换，不做实时渲染和音频序号的区分。
 
     updatedUrl = ""
+    image_ok = True
     print("是否进行实时图片生成: ", realTimeGeneration)
     if (realTimeGeneration):
         print("实时图片生成调用")
@@ -248,7 +271,12 @@ def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGene
         except Exception as exception:
             print("Url out of date, regenerating...")
             traceback.print_exc()
-            updatedUrl = original_image_generation(roleName, "".join([emotion, " because ", emo_desc]), index)
+            try:
+                updatedUrl = original_image_generation(roleName, "".join([emotion, " because ", emo_desc]), index)
+            except Exception:
+                traceback.print_exc()
+                updatedUrl = ""
+                image_ok = False
         # 一旦更新了index，那么前端应当调用的图片，就是当前index-1.同时如果index==0，那么调用图片的index就是9.
 
         # 将最新的index和url更新入文本文档内
@@ -268,16 +296,34 @@ def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGene
         # 这个纠错模式不是不可行，但是很明显有更节省资源的方法。
         # 但是现阶段先将东西做出来再说优化吧。
         print("静态图片生成调用")
-        updatedUrl = static_images(roleName, imageModel)
+        try:
+            updatedUrl = static_images(roleName, imageModel)
+        except Exception:
+            traceback.print_exc()
+            updatedUrl = ""
+            image_ok = False
 
     index = int(index)
     index = (index + 1) % 10
     updatedIndex = str(index)
-    updateLinks(roleName, updatedUrl, updatedIndex)
+
+    # 缺陷 B07：本次没有新生成图片时（静态资源已存在），绝不能用空串覆盖
+    # Records 里已有的 Recent_Url。否则参考图链条一断，之后每轮都会退化成
+    # 昂贵的文生图重生成，100 元预算会瞬间烧光。
+    recordsUrl = updatedUrl if updatedUrl else imgurl
+
+    # 缺陷 N01：写回必须和「读取槽位」处在同一把角色锁内。
+    # 原先 updateLinks 在锁外执行，并发下两个请求会各自读到旧值再互相覆盖，
+    # 导致 index 回退、不同请求复用同一个资源槽位并覆盖彼此的图片/语音。
+    with _lock_for(roleName):
+        updateLinks(roleName, recordsUrl, updatedIndex)
 
     print("运行到这里了，Check!")
 
-    return answer, str((index-1)%10), imageEmotion[0], updatedUrl
+    # 缺陷 009：语音或图片任一失败，都要如实降级为 partial。
+    status = "success" if (voice_ok and image_ok) else "partial"
+
+    return answer, str((index-1)%10), imageEmotion[0], updatedUrl, status
     #此处返回的index必须-1，或者归为9(index==0时)，才能正确索引应使用图片及语音。
 
 

@@ -101,7 +101,8 @@ def test_tc_llm_01_role_prompt_appends_emotion_constraints(monkeypatch, tmp_path
         "mock-model", "Wendy", {"role": "user", "content": "你好"}
     ) == "固定回复"
     system_prompt = captured["messages"][0]
-    assert system_prompt["role"] == "assistant"
+    # N02 修复后：人设必须用 system 承载，塞进 assistant 会让人格约束减半。
+    assert system_prompt["role"] == "system"
     assert system_prompt["content"].startswith("固定角色描述")
     for emotion in ("中性", "高兴", "悲伤", "害怕", "生气", "惊喜", "害羞"):
         assert emotion in system_prompt["content"]
@@ -169,7 +170,7 @@ def test_tc_tts_01_valid_base64_is_saved_with_expected_payload(monkeypatch, tmp_
 
     monkeypatch.setattr(Voice.requests, "post", post)
     result = Voice.Voice_Generation_through_http(
-        "Wendy", "fixed-voice", "happy", "固定文本", "3"
+        "Wendy", "fixed-voice", "happy", "固定文本", "3", provider="volcengine"
     )
     assert Path(result).read_bytes() == audio
     assert (assets / "voice" / "Wendy" / "Wendy_3_Stream.mp3").read_bytes() == audio
@@ -225,7 +226,7 @@ def test_tc_tts_05_non_json_response_propagates_error(monkeypatch, tmp_path):
     monkeypatch.setattr(Voice.requests, "post", lambda **_kwargs: Response())
     with pytest.raises(ValueError, match="non-json"):
         Voice.Voice_Generation_through_http(
-            "Wendy", "fixed-voice", "neutral", "固定文本", "3"
+            "Wendy", "fixed-voice", "neutral", "固定文本", "3", provider="volcengine"
         )
 
 
@@ -246,7 +247,11 @@ def test_tc_img_01_seven_static_images_skip_generation(monkeypatch, tmp_path):
 
 
 def test_tc_img_02_six_static_images_trigger_regeneration(monkeypatch, tmp_path):
-    """TC-IMG-02：缺一张静态图时生成 neutral 和其余六种情绪。"""
+    """TC-IMG-02：缺一张静态图时只补生成缺失的那一（B05 修复后）。
+
+    缺陷 B05 修复前，只要缺一张就把 7 张全部重生成，一次误判就是 7 张图的钱。
+    修复后只补缺失项，因此这里断言"总生成次数 == 缺失数量"而不是 == 7。
+    """
     assets, _records = make_workspace(monkeypatch, tmp_path)
     role_dir = assets / "pictures" / "Wendy"
     role_dir.mkdir(parents=True)
@@ -265,8 +270,8 @@ def test_tc_img_02_six_static_images_trigger_regeneration(monkeypatch, tmp_path)
         lambda *args: emotional_calls.append(args) or "generated-url",
     )
     assert Image.static_images("Wendy", "mock-image") == "initial-url"
-    assert len(original_calls) == 1
-    assert len(emotional_calls) == 6
+    # 只缺 shy 一张，因此总共只应产生 1 次生成调用（而不是 1 + 6 = 7 次）
+    assert len(original_calls) + len(emotional_calls) == 1
 
 
 def test_tc_img_03_realtime_generation_uses_recent_url(monkeypatch, tmp_path):

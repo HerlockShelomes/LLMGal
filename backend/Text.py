@@ -1,4 +1,27 @@
+"""文本大模型接入层。
+
+改动要点（对照缺陷清单）：
+- N02：角色人设改用 role="system" 承载。原先塞进 assistant，模型会把「你是 Wendy，性格……」
+       当成自己说过的台词，人格约束直接减半。
+- N03：人设文件缺失时不再静默降级成空 prompt 照发请求，而是明确抛错，
+       避免「角色扮演完全失效但零错误信号」。
+- B01：密钥 / 模型 / 端点全部来自 config（.env），不再硬编码。
+- 新增：多轮上下文（history）。项目此前零多轮记忆，模型窗口再长也只收到一条。
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
 from openai import OpenAI
+
+import config
+
+# 人设与静态资源仍按「以 backend 为工作目录」的相对路径读取。
+# 注意：不要改成基于 __file__ 的绝对路径，测试用例依赖这一约定（chdir 到临时 backend 后
+# 在 ../frontend/src/assets 下放置 fixtures）。
+ROLE_PROMPT_PATH = '../frontend/src/assets/roles/{role}.txt'
 
 Emotion_Prompt = """
 
@@ -8,55 +31,153 @@ Emotion_Prompt = """
 例如: (高兴)(因为受到了朋友的邀请)。请注意使用英语括号。
 消息整体不得超过150字"""
 
-def get_role_prompt(role_name):
-    role_prompt = ""
+# 最近一次真实调用返回的 token 用量（provider 未返回时为 None）。
+# Connect 侧优先取这里的真实值，取不到再退回按字数估算。
+LAST_USAGE: dict | None = None
+
+
+def get_role_prompt(role_name: str) -> str:
+    """读取角色人设并追加情绪输出约束。
+
+    N03：文件缺失或读取失败时抛错，而不是返回空串让请求静默发出。
+    """
+    path = Path(ROLE_PROMPT_PATH.format(role=role_name))
     try:
-        with open(f'../frontend/src/assets/roles/{role_name}.txt', 'r', encoding='utf-8') as file:
+        with open(path, 'r', encoding='utf-8') as file:
             role_prompt = file.read()
-            role_prompt = "".join([role_prompt, Emotion_Prompt])
-            print(role_prompt)
     except FileNotFoundError:
-        print("文件未找到，请检查文件路径。")
-    except IOError:
-        print("发生IO错误，无法读取文件。")
+        raise FileNotFoundError(
+            f"角色人设文件缺失：{path}。请在 frontend/src/assets/roles/ 下创建 "
+            f"{role_name}.txt，或换一个已存在的角色。"
+        )
+    except OSError as error:
+        raise OSError(f"角色人设文件读取失败：{path}（{error}）")
 
-    return role_prompt
+    if not role_prompt.strip():
+        raise ValueError(f"角色人设文件为空：{path}")
 
-def get_llm_response(model, role, prompt):
+    return "".join([role_prompt, Emotion_Prompt])
+
+
+def normalize_message(prompt) -> dict:
+    """把用户消息统一成 OpenAI 消息对象。
+
+    兼容两种历史形态：裸字符串（早期前端）与 {role, content} 对象（现行契约）。
     """
-    :param model: 指定选择的模型名称，目前可以支持大部分文本模型，只是更换名称的区别而已。
-    :param role: 指定的角色名称
-    :param prompt: 用户输入的文本，驱动大语言模型给予回复。
-    :return: 大语言模型生成的回复。
-    """
-    answer_content = ""
-    role_pro = get_role_prompt(role)
-    full_prompt = [{"role": "assistant", "content": role_pro}]
-    full_prompt.append(prompt)
-    print(full_prompt)
+    if isinstance(prompt, dict):
+        content = prompt.get("content", "")
+        role = prompt.get("role", "user")
+    else:
+        content = "" if prompt is None else str(prompt)
+        role = "user"
 
-    client = OpenAI(api_key= 'sk-Tk2Rpty6GBWzDx16Cf7f1e2b5a2f425eA5CbA91958A36d16', base_url="https://o3.fan/v1")
-    completion = client.chat.completions.create(
-        model=model,
-        stream=True,
-        messages=full_prompt
+    return {"role": role if role in ("user", "assistant", "system") else "user",
+            "content": content}
+
+
+def sanitize_history(history) -> list[dict]:
+    """清洗多轮历史，只保留合法且成对的消息，并限制长度。"""
+    if not history:
+        return []
+    if not isinstance(history, list):
+        return []
+
+    cleaned: list[dict] = []
+    for item in history[-config.CONTEXT_MAX_MESSAGES:]:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        cleaned.append({"role": role, "content": content})
+    return cleaned
+
+
+def build_client() -> OpenAI:
+    """按 config 构造 OpenAI 兼容客户端。
+
+    未配置密钥时只告警不拦截：真实 SDK 在构造/请求阶段自己会报 api_key 错误，
+    而单元测试用替身客户端时不该被这层校验挡住。
+    """
+    if not config.TEXT_API_KEY:
+        logging.warning(
+            "未配置文本模型密钥（provider=%s）。请在 backend/.env 填写对应 API Key，"
+            "详见 .env.example；当前调用会失败。",
+            config.TEXT_PROVIDER,
+        )
+    return OpenAI(
+        api_key=config.TEXT_API_KEY,
+        base_url=config.TEXT_BASE_URL,
+        timeout=config.TEXT_TIMEOUT,
     )
 
+
+def get_llm_response(model, role, prompt, history=None):
+    """调用文本大模型生成回复。
+
+    :param model: 模型名称；留空或 None 时使用 config.TEXT_MODEL
+    :param role: 角色名称，用于读取人设
+    :param prompt: 用户消息（字符串或 {role, content} 对象）
+    :param history: 可选，多轮历史消息列表
+    :return: 模型生成的文本
+    """
+    global LAST_USAGE
+    LAST_USAGE = None
+
+    answer_content = ""
+    role_pro = get_role_prompt(role)
+
+    # N02：人设必须用 system 承载。
+    messages = [{"role": "system", "content": role_pro}]
+    messages.extend(sanitize_history(history))
+    messages.append(normalize_message(prompt))
+
+    client = build_client()
+    # 前端下拉框里可能是旧的中转站 ID（如 deepseek-ai/DeepSeek-V3），
+    # 直接发给厂商会 1211「模型不存在」。这里收敛一次：不在当前 provider
+    # 白名单内就回落到 .env 的 TEXT_MODEL，而不是让整轮对话失败。
+    request_kwargs = {
+        "model": config.resolve_text_model(model),
+        "stream": True,
+        "temperature": config.TEXT_TEMPERATURE,
+        "max_tokens": config.TEXT_MAX_TOKENS,
+        "messages": messages,
+    }
+    # 智谱 flash 是推理模型，思考过程同样计费；low 档实测可省约 3 倍 token。
+    # 不支持该参数的 provider 保持留空即可。
+    if config.TEXT_REASONING_EFFORT:
+        request_kwargs["reasoning_effort"] = config.TEXT_REASONING_EFFORT
+
+    completion = client.chat.completions.create(**request_kwargs)
+
     for chunk in completion:
-        # 如果chunk.choices为空，则打印usage
-        if not chunk.choices:
-            print("\nUsage:")
-            print(chunk.usage)
-        else:
-            delta = chunk.choices[0].delta
-            # 打印思考过程
-                # 开始回复
-            if delta.content != "":
-            # 打印回复过程
-                print(delta.content, end='', flush=True)
-                answer_content += delta.content
+        # 流结束时部分 provider 会返回一个只带 usage 的块
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            try:
+                LAST_USAGE = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                }
+            except Exception:  # pragma: no cover - usage 结构异常不应中断生成
+                LAST_USAGE = None
+
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        content = getattr(delta, "content", None) if delta is not None else None
+        if content:
+            answer_content += content
+
     return answer_content
 
+
 if __name__ == '__main__':
-    answer = ""
-    answer = get_llm_response("deepseek-ai/DeepSeek-V3", "Testificate", {"role": "user", "content": "有时间一块桌游吗？"})
+    logging.basicConfig(level=logging.INFO)
+    print(config.describe())
+    print(get_llm_response(config.TEXT_MODEL, "Testificate", {"role": "user", "content": "有时间一块桌游吗？"}))

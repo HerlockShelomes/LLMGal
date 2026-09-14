@@ -12,9 +12,18 @@ export interface ClientMessage<T extends ClientMessageType>{
 export interface ServerMessage<T extends ServerMessageType> {
     type: T;
     message_id: string;
-    status: string;
+    status: ServerStatus;
     payload: ServerPayload[T];
 }
+
+//多轮上下文里的一条历史消息（正序，不含当前这条提问）
+export type HistoryMessage = {
+    role: 'user' | 'assistant';
+    content: string;
+};
+
+//服务端 status 的合法取值
+export type ServerStatus = "success" | "partial" | "error";
 
 //Type Enums:
 export enum ClientMessageType {
@@ -27,6 +36,8 @@ export enum ServerMessageType {
     RESPONSE = "assistant_response",
     PROGRESS = "stream_progress",
     ERROR = "error",
+    //后端判定 payload 非法时下发（缺失 role / modelText / realTimeRendering，或 text 是裸字符串）
+    INVALID = "invalid_message",
 }
 
 //Payload Enums:
@@ -42,6 +53,9 @@ export type ClientPayload =  {
             realTimeRendering: boolean;
         };
         voiceCate: string;
+        //多轮上下文：按会话组织，时间正序，不含当前这条；后端暂无该字段时可缺省
+        history?: HistoryMessage[];
+        sessionId?: string;
     };
 
     [ClientMessageType.CANCEL]: {
@@ -79,6 +93,10 @@ export type ServerPayload = {
         message: string;
         detail: string;
     };
+
+    [ServerMessageType.INVALID]: {
+        reason: string;
+    };
 }
 
 //---辅助参数验证类型---
@@ -97,6 +115,8 @@ export function isClientMessgage(
     );
 }
 
+const VALID_STATUSES: ServerStatus[] = ["success", "partial", "error"];
+
 export function isServerMessage(
     data: unknown
 ): data is AnyServerMessage {
@@ -105,6 +125,9 @@ export function isServerMessage(
     return (
         Object.values(ServerMessageType).includes(msg.type) &&
         typeof msg.message_id === "string" &&
+        //status 必须存在且落在 success / partial / error 之内，
+        //否则缺 status 的报文会被当成合法响应，partial 与错误态都会被误判成成功。
+        VALID_STATUSES.includes(msg.status) &&
         "payload" in msg
     );
 }

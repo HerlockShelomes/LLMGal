@@ -1,12 +1,17 @@
 import asyncio
 import base64
-import websockets
-import uuid
-import json
-import gzip
 import copy
+import gzip
+import json
+import logging
 import os
+import re
+import uuid
+
 import requests
+import websockets
+
+import config
 
 MESSAGE_TYPES = {11: "audio-only server response", 12: "frontend server response", 15: "error message from server"}
 MESSAGE_TYPE_SPECIFIC_FLAGS = {0: "no sequence number", 1: "sequence number > 0",
@@ -14,12 +19,51 @@ MESSAGE_TYPE_SPECIFIC_FLAGS = {0: "no sequence number", 1: "sequence number > 0"
 MESSAGE_SERIALIZATION_METHODS = {0: "no serialization", 1: "JSON", 15: "custom type"}
 MESSAGE_COMPRESSIONS = {0: "no compression", 1: "gzip", 15: "custom compression method"}
 
-appid = "7535590105"
-token = "_SRNKZhKXevBrx72wklF-D8NX7LGigGs"
-cluster = "volcano_tts"
+# 火山（volcengine）凭据：原先硬编码在源码里（缺陷 B01），现改为从 .env 读取。
+appid = config.TTS_VOLC_APPID
+token = config.TTS_VOLC_TOKEN
+cluster = config.TTS_VOLC_CLUSTER
 host = "openspeech.bytedance.com"
 api_url = f"wss://{host}/api/v1/tts/ws_binary"
 reqid = uuid.uuid4()
+
+
+def strip_emotion_tags(text: str) -> str:
+    """剔除正文开头的情绪括号。
+
+    缺陷 N04：LLM 的原文形如「(高兴)(因为受到邀请)你好呀」，直接送 TTS 会让用户
+    亲耳听到「（高兴）（因为受到邀请）」被念出来。只剥离开头的连续括号组，
+    正文中间正常使用的括号不受影响。
+    """
+    if not text:
+        return ""
+    return re.sub(r'^\s*(?:\([^()]*\)\s*)+', '', text)
+
+
+# 情绪标签（Integration 用英文）→ 中文演播指令，供 Qwen3-TTS 的 instructions 使用
+EMOTION_TO_CHINESE = {
+    "neutral": "平静",
+    "happy": "开心",
+    "sad": "悲伤",
+    "fear": "害怕",
+    "angry": "生气",
+    "surprised": "惊喜",
+    "shy": "害羞",
+}
+
+
+def resolve_qwen_voice(volc_voice: str, role: str = "") -> str:
+    """决定本次合成用哪个 Qwen3-TTS 音色。
+
+    优先级：角色名登记的专属音色 > 火山音色 ID 映射 > 全局默认。
+
+    前端原先对所有角色都发同一个 voiceCate，四个角色说话一模一样。
+    现在以角色为主键，未登记的角色仍走原来的 voiceCate 映射，行为不变。
+    """
+    role_voice = config.resolve_role_voice(role, "")
+    if role_voice:
+        return role_voice
+    return config.VOLC_TO_QWEN_VOICE.get(volc_voice, config.TTS_QWEN_DEFAULT_VOICE)
 
 
 # version: b0001 (4 bits)
@@ -113,7 +157,7 @@ async def test_submit(r,v,e,t, i):
     savePath = f"../frontend/src/assets/voice/{Role}/{Role}_{i}_Stream.mp3"
     os.makedirs(os.path.dirname(savePath), exist_ok=True)
     file_to_save = open(savePath, "wb")
-    async with websockets.connect(api_url, extra_headers={"Authorization": "Bearer; _SRNKZhKXevBrx72wklF-D8NX7LGigGs"}, ping_interval=None) as ws:
+    async with websockets.connect(api_url, extra_headers={"Authorization": f"Bearer; {token}"}, ping_interval=None) as ws:
         await ws.send(full_client_request)
         while True:
             res = await ws.recv()
@@ -188,7 +232,7 @@ async def Voice_Generation (role, voiType, emoType, text, i):
     task = [asyncio.create_task(test_submit(role, voiType, emoType, text, i))]
     await asyncio.gather(*task, return_exceptions=True)
 
-def save_audio_from_base64(audio: str, role, index) -> str:
+def save_audio_from_base64(audio: str, role, index, ext: str = "mp3") -> str:
     try:
         # 合法 Base64 允许按 76 字符折行（RFC 2045），先剥离空白再严格校验，
         # 避免合法换行被 validate 判定为非法字符。
@@ -200,7 +244,7 @@ def save_audio_from_base64(audio: str, role, index) -> str:
             print("音频数据为空，跳过保存")
             return ""
 
-        savePath = f"../frontend/src/assets/voice/{role}/{role}_{index}_Stream.mp3"
+        savePath = f"../frontend/src/assets/voice/{role}/{role}_{index}_Stream.{ext}"
         os.makedirs(os.path.dirname(savePath), exist_ok=True)
         with open(savePath, 'wb') as audio_file:
             audio_file.write(audio_data)
@@ -213,13 +257,122 @@ def save_audio_from_base64(audio: str, role, index) -> str:
         return ""
 
 
-def Voice_Generation_through_http(r, v, e, t, i):
+def save_audio_from_bytes(audio: bytes, role, index, ext: str = "mp3") -> str:
+    """把已解码的音频字节落盘到前端静态资源目录。
+
+    :param ext: 扩展名。火山返回 mp3；阿里 Qwen3-TTS 实测返回 WAV，
+                两者不能混用同一个扩展名，否则浏览器按错误的 MIME 解析。
+    """
+    if not audio:
+        print("音频数据为空，跳过保存")
+        return ""
+
+    savePath = f"../frontend/src/assets/voice/{role}/{role}_{index}_Stream.{ext}"
+    os.makedirs(os.path.dirname(savePath), exist_ok=True)
+    with open(savePath, 'wb') as audio_file:
+        audio_file.write(audio)
+
+    print("音频已保存: ", savePath)
+    return savePath
+
+
+def _tts_qwen(r, v, e, t, i):
+    """阿里百炼 Qwen3-TTS（DashScope 多模态生成接口）。
+
+    每月 100 万字符免费，国内账号、免信用卡，是本项目测试期语音成本归零的关键。
+
+    接口要点（与常见猜测不同，均已实测）：
+    - 端点不是 OpenAI 的 /compatible-mode/v1/audio/speech（那个返回 404），
+      而是 /api/v1/services/aigc/multimodal-generation/generation；
+    - 请求体是 {"model", "input": {"text", "voice", "language_type"}}；
+    - 非流式响应里 output.audio.data 是空的，真实音频在 output.audio.url（临时 OSS 链接）；
+    - 返回的是 WAV 而不是 MP3，落盘扩展名必须跟上。
+    """
+    if t is None:
+        return ""
+    text = str(t).strip()
+    if not text:
+        print("待合成文本为空，跳过语音生成")
+        return ""
+    if len(text) > config.TTS_QWEN_MAX_CHARS:
+        print(f"文本超过 {config.TTS_QWEN_MAX_CHARS} 字符上限，已截断")
+        text = text[: config.TTS_QWEN_MAX_CHARS]
+
+    use_instruct = bool(config.TTS_QWEN_USE_INSTRUCTIONS and e)
+    model = config.TTS_QWEN_INSTRUCT_MODEL if use_instruct else config.TTS_QWEN_MODEL
+
+    body = {
+        "model": model,
+        "input": {
+            "text": text,
+            "voice": resolve_qwen_voice(v, r),
+            "language_type": config.TTS_QWEN_LANGUAGE,
+        },
+    }
+    if use_instruct:
+        # 情绪标签在 Integration 里是英文，这里换成中文演播指令
+        body["input"]["instructions"] = f"用{EMOTION_TO_CHINESE.get(e, '平静')}的语气说话"
+
+    response = requests.post(
+        url=config.TTS_QWEN_ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {os.environ.get('DASHSCOPE_API_KEY', '')}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    audio = ((response.json().get("output") or {}).get("audio") or {})
+    audio_url = audio.get("url")
+    if audio_url:
+        # 非流式响应不回 base64，音频在临时链接上，需二次下载（会过期，立即取）
+        audio_resp = requests.get(url=audio_url, timeout=60)
+        audio_resp.raise_for_status()
+        return save_audio_from_bytes(audio_resp.content, r, i, ext="wav")
+
+    if audio.get("data"):
+        return save_audio_from_base64(audio["data"], r, i, ext="wav")
+
+    raise RuntimeError(f"语音服务未返回音频地址：{response.text[:200]}")
+
+
+def Voice_Generation_through_http(r, v, e, t, i, provider=None):
+    """语音合成统一入口。
+
+    :param provider: 覆盖 config.TTS_PROVIDER，可选 "qwen" / "volcengine"。
+                     单元测试会显式指定，避免默认 provider 变化影响既有断言。
+    :return: 成功返回音频文件路径，失败返回空串（调用方据此把状态降级为 partial）。
+    """
+    selected = (provider or config.TTS_PROVIDER or "qwen").lower()
+    # N04：无论哪家，送进 TTS 前都要剥掉开头的情绪括号
+    clean_text = strip_emotion_tags(t if isinstance(t, str) else str(t or ""))
+
+    try:
+        if selected == "volcengine":
+            return _tts_volcengine(r, v, e, clean_text, i)
+        return _tts_qwen(r, v, e, clean_text, i)
+    except requests.exceptions.RequestException as error:
+        print(f'Request Failed: {error}')
+        return ''
+    except (KeyError, ValueError) as error:
+        # 非 JSON 响应等仍然向上抛出，交由调用方判定为处理失败
+        print(f'TTS 响应解析失败: {error}')
+        raise
+    except Exception as error:  # 其余异常不应拖垮整条对话
+        logging.exception("语音合成失败")
+        print(f'语音合成失败: {error}')
+        return ''
+
+
+def _tts_volcengine(r, v, e, t, i):
 
     httpurl = "https://openspeech.bytedance.com/api/v1/tts"
 
     theHeaders = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer; _SRNKZhKXevBrx72wklF-D8NX7LGigGs",
+        "Authorization": f"Bearer; {token}",
     }
 
     payload_json = {
@@ -276,4 +429,11 @@ def Voice_Generation_through_http(r, v, e, t, i):
 
 
 if __name__ == "__main__":
-    Voice_Generation_through_http('Testificate', 'zh_female_tianxinxiaomei_emo_v2_mars_bigtts', 'neutral','猎人大人好喵！今天我们一起去狩猎萌宝吧！','test')
+    print(config.describe())
+    print(Voice_Generation_through_http(
+        'Testificate',
+        'zh_female_tianxinxiaomei_emo_v2_mars_bigtts',
+        'neutral',
+        '猎人大人好喵！今天我们一起去狩猎萌宝吧！',
+        'test',
+    ))
