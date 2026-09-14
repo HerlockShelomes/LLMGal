@@ -37,6 +37,8 @@ export class LLMClient {
         //绑定消息处理器
         this.wsManager.on('message', this.handleMessage.bind(this));
         this.wsManager.on('error', this.handleError.bind(this));
+        //连接恢复后重放发送失败的请求
+        this.wsManager.on('connected', this.handleReconnect.bind(this));
 
         if (this.options.autoConnect) {
             this.connect();
@@ -53,8 +55,7 @@ export class LLMClient {
     }
 
     public async sendQuery(
-        params: Omit<ClientPayload[ClientMessageType.QUERY], 'text'> &  {
-            text: string
+        params: ClientPayload[ClientMessageType.QUERY] & {
             onProgress?: (progress: number) => void
         }
     ): Promise<ServerPayload[ServerMessageType.RESPONSE]> {
@@ -83,11 +84,14 @@ export class LLMClient {
                         modelText: params.textModel_config.modelText,
                     },
                     role: params.role,   //角色选择
-                    imageMode_config: {
-                        modelImage: params.imageMode_config.modelImage,
-                        realTimeRendering: params.imageMode_config.realTimeRendering,
+                    imageModel_config: {
+                        modelImage: params.imageModel_config.modelImage,
+                        realTimeRendering: params.imageModel_config.realTimeRendering,
                     },
                     voiceCate: params.voiceCate,
+                    //多轮上下文：时间正序，不含当前这条
+                    ...(params.history ? { history: params.history } : {}),
+                    ...(params.sessionId ? { sessionId: params.sessionId } : {}),
                 }
             };
 
@@ -117,10 +121,13 @@ export class LLMClient {
                         resolve(value);
                     };
                 }
-            } catch (error) {
-                this.pendingRequests.delete(messageID);
-                reject(error);
-            }
+                } catch (error) {
+                    //发送失败多半是连接已断：保留 pending 记录并入队等重连后重发，
+                    //响应回来时仍能对应到同一个 promise。这里不能直接 reject，
+                    //否则一次闪断就把请求判死；真正的失败由超时或重试用尽来兜底。
+                    this.enqueueRetry(message);
+                    console.error('请求发送失败，已加入重试队列: ', error);
+                }
         });
     }
 
@@ -183,7 +190,6 @@ export class LLMClient {
         if (!request) return;
 
         clearTimeout(request.timeoutID);
-        this.pendingRequests.delete(messageID);
 
         const cancelMsg: AnyClientMessage = {
             type: ClientMessageType.CANCEL,
@@ -195,20 +201,64 @@ export class LLMClient {
 
         try {
             this.wsManager.send(cancelMsg);
-            request.reject(new Error('请求已被用户取消'));
         } catch (error) {
             console.error('发送请求失败: ', error);
         }
+
+        //顺序不能反：先 reject 再清理。反过来的话 reject 一旦抛异常
+        //就会跳过 delete，这条请求会永久留在表里占用内存。
+        request.reject(new Error('请求已被用户取消'));
+        this.pendingRequests.delete(messageID);
     }
 
+    //重发队列：发送失败的请求在此排队，连接恢复后重放
     private retryQueue: Array<{
         message: AnyClientMessage;
         retriesLeft: number;
     }> = [];
 
-    public handleReconnect() {
-        this.retryQueue.forEach(item => {
-            this.wsManager.send(item.message);
+    private readonly maxRetriesPerMessage = 3;
+
+    private enqueueRetry(message: AnyClientMessage): void {
+        this.retryQueue.push({
+            message,
+            retriesLeft: this.maxRetriesPerMessage,
         });
+    }
+
+    //连接恢复后重放队列。重试用尽的请求要主动 reject 掉对应的 pending promise，
+    //否则调用方会一直挂在那儿等一个永远不来的响应。
+    public handleReconnect() {
+        const queue = this.retryQueue;
+        this.retryQueue = [];
+
+        queue.forEach(item => {
+            try {
+                this.wsManager.send(item.message);
+            } catch (error) {
+                if (item.retriesLeft > 0) {
+                    this.retryQueue.push({
+                        message: item.message,
+                        retriesLeft: item.retriesLeft - 1,
+                    });
+                    return;
+                }
+
+                console.error('请求重试用尽，已丢弃: ', error);
+                const pending = this.pendingRequests.get(item.message.message_id);
+                if (pending) {
+                    clearTimeout(pending.timeoutID);
+                    this.pendingRequests.delete(item.message.message_id);
+                    pending.reject(new Error('请求重试用尽，已丢弃'));
+                }
+            }
+        });
+    }
+
+    public disconnect(): void {
+        this.retryQueue = [];
+        this.pendingRequests.forEach(request => clearTimeout(request.timeoutID));
+        this.pendingRequests.clear();
+        this.wsManager.disconnect();
     }
 }

@@ -101,7 +101,8 @@ def test_tc_llm_01_role_prompt_appends_emotion_constraints(monkeypatch, tmp_path
         "mock-model", "Wendy", {"role": "user", "content": "你好"}
     ) == "固定回复"
     system_prompt = captured["messages"][0]
-    assert system_prompt["role"] == "assistant"
+    # N02 修复后：人设必须用 system 承载，塞进 assistant 会让人格约束减半。
+    assert system_prompt["role"] == "system"
     assert system_prompt["content"].startswith("固定角色描述")
     for emotion in ("中性", "高兴", "悲伤", "害怕", "生气", "惊喜", "害羞"):
         assert emotion in system_prompt["content"]
@@ -169,7 +170,7 @@ def test_tc_tts_01_valid_base64_is_saved_with_expected_payload(monkeypatch, tmp_
 
     monkeypatch.setattr(Voice.requests, "post", post)
     result = Voice.Voice_Generation_through_http(
-        "Wendy", "fixed-voice", "happy", "固定文本", "3"
+        "Wendy", "fixed-voice", "happy", "固定文本", "3", provider="volcengine"
     )
     assert Path(result).read_bytes() == audio
     assert (assets / "voice" / "Wendy" / "Wendy_3_Stream.mp3").read_bytes() == audio
@@ -203,7 +204,6 @@ def test_tc_tts_02_timeout_returns_empty_and_flow_continues(monkeypatch, tmp_pat
     assert "index:4" in records.read_text(encoding="utf-8")
 
 
-@pytest.mark.xfail(strict=True, reason="TC-TTS-04：当前实现会写入零字节音频")
 def test_tc_tts_04_invalid_base64_must_not_create_audio(monkeypatch, tmp_path):
     """TC-TTS-04：非法 Base64 应返回空串且不创建有效 mp3。"""
     assets, _records = make_workspace(monkeypatch, tmp_path)
@@ -226,7 +226,7 @@ def test_tc_tts_05_non_json_response_propagates_error(monkeypatch, tmp_path):
     monkeypatch.setattr(Voice.requests, "post", lambda **_kwargs: Response())
     with pytest.raises(ValueError, match="non-json"):
         Voice.Voice_Generation_through_http(
-            "Wendy", "fixed-voice", "neutral", "固定文本", "3"
+            "Wendy", "fixed-voice", "neutral", "固定文本", "3", provider="volcengine"
         )
 
 
@@ -247,7 +247,11 @@ def test_tc_img_01_seven_static_images_skip_generation(monkeypatch, tmp_path):
 
 
 def test_tc_img_02_six_static_images_trigger_regeneration(monkeypatch, tmp_path):
-    """TC-IMG-02：缺一张静态图时生成 neutral 和其余六种情绪。"""
+    """TC-IMG-02：缺一张静态图时只补生成缺失的那一（B05 修复后）。
+
+    缺陷 B05 修复前，只要缺一张就把 7 张全部重生成，一次误判就是 7 张图的钱。
+    修复后只补缺失项，因此这里断言"总生成次数 == 缺失数量"而不是 == 7。
+    """
     assets, _records = make_workspace(monkeypatch, tmp_path)
     role_dir = assets / "pictures" / "Wendy"
     role_dir.mkdir(parents=True)
@@ -266,8 +270,8 @@ def test_tc_img_02_six_static_images_trigger_regeneration(monkeypatch, tmp_path)
         lambda *args: emotional_calls.append(args) or "generated-url",
     )
     assert Image.static_images("Wendy", "mock-image") == "initial-url"
-    assert len(original_calls) == 1
-    assert len(emotional_calls) == 6
+    # 只缺 shy 一张，因此总共只应产生 1 次生成调用（而不是 1 + 6 = 7 次）
+    assert len(original_calls) + len(emotional_calls) == 1
 
 
 def test_tc_img_03_realtime_generation_uses_recent_url(monkeypatch, tmp_path):
@@ -342,8 +346,8 @@ def test_tc_res_02_index_nine_wraps_to_zero(monkeypatch, tmp_path):
     assert "index:0" in records.read_text(encoding="utf-8")
 
 
-def test_tc_res_03_missing_records_falls_back_then_write_fails(monkeypatch, tmp_path):
-    """TC-RES-03：Records 缺失时先静态降级，随后更新记录失败。"""
+def test_tc_res_03_missing_records_falls_back_then_write_succeeds(monkeypatch, tmp_path):
+    """TC-RES-03：Records 缺失时静态降级，并在写回阶段自动初始化记录。"""
     backend_dir = tmp_path / "backend"
     backend_dir.mkdir()
     monkeypatch.chdir(backend_dir)
@@ -362,26 +366,41 @@ def test_tc_res_03_missing_records_falls_back_then_write_fails(monkeypatch, tmp_
     monkeypatch.setattr(
         Integration, "emotional_bro", lambda *args: realtime_calls.append(args)
     )
-    with pytest.raises(FileNotFoundError):
-        call_collection(realtime=True)
+    # 修复后：不再因为 Records 缺失而在写回阶段抛 FileNotFoundError。
+    call_collection(realtime=True)
     assert voice_calls[0][4] == "0"
     assert static_calls == [("Wendy", "mock-image")]
     assert realtime_calls == []
+    records = tmp_path / "frontend" / "src" / "assets" / "Records.txt"
+    assert records.exists()
+    assert "Wendy:" in records.read_text(encoding="utf-8")
+    assert "index:1" in records.read_text(encoding="utf-8")
 
 
-def test_tc_ex_01_missing_role_record_fails_before_external_calls(monkeypatch, tmp_path):
-    """TC-EX-01：角色记录缺失时 matches[0] 抛异常且未调用外部服务。"""
+def test_tc_ex_01_missing_role_record_falls_back_without_crash(monkeypatch, tmp_path):
+    """TC-EX-01：角色记录缺失时受控降级为静态模式，不抛未受控异常。"""
     make_workspace(monkeypatch, tmp_path, role="Other")
     calls = []
+    static_calls = []
     monkeypatch.setattr(
-        Integration, "get_llm_response", lambda *_args: calls.append("llm")
+        Integration,
+        "get_llm_response",
+        lambda *_args: calls.append("llm") or FIXED_REPLY,
     )
-    with pytest.raises(IndexError):
-        call_collection()
-    assert calls == []
+    monkeypatch.setattr(Integration, "Voice_Generation_through_http", lambda *_args: "")
+    monkeypatch.setattr(
+        Integration,
+        "static_images",
+        lambda *args: static_calls.append(args) or "static-url",
+    )
+    # 修复后：角色记录缺失时走与文件缺失相同的降级路径，外部调用照常进行。
+    result = call_collection()
+    assert calls == ["llm"]
+    assert static_calls == [("Wendy", "mock-image")]
+    assert result[1] == "0"
+    assert result[3] == "static-url"
 
 
-@pytest.mark.xfail(strict=True, reason="TC-EX-02：正则表达式先排除了非数字索引")
 def test_tc_ex_02_nonnumeric_index_fails_after_external_side_effects(monkeypatch, tmp_path):
     """TC-EX-02：按清单预期，非数字索引应在外部副作用之后转换失败。"""
     _assets, records = make_workspace(monkeypatch, tmp_path)
@@ -403,8 +422,8 @@ def test_tc_ex_02_nonnumeric_index_fails_after_external_side_effects(monkeypatch
     assert calls == ["llm", "tts"]
 
 
-def test_tc_con_01_concurrent_requests_share_same_slot(monkeypatch, tmp_path):
-    """TC-CON-01：强制并发交错，验证两个请求读取并使用同一资源槽。"""
+def test_tc_con_01_concurrent_requests_use_distinct_slots(monkeypatch, tmp_path):
+    """TC-CON-01：强制并发交错，验证两个请求被分配到互不相同的资源槽。"""
     make_workspace(monkeypatch, tmp_path, index="3")
     barrier = Barrier(2)
     voice_slots = []
@@ -428,6 +447,7 @@ def test_tc_con_01_concurrent_requests_share_same_slot(monkeypatch, tmp_path):
     )
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _item: call_collection(), range(2)))
-    assert voice_slots == ["3", "3"]
-    assert [result[1] for result in results] == ["3", "3"]
-    assert updates == [("Wendy", "", "4"), ("Wendy", "", "4")]
+    # 修复后：两个并发请求在锁内依次推进槽位，拿到 3 与 4 两个不同槽。
+    assert sorted(voice_slots) == ["3", "4"]
+    assert sorted(result[1] for result in results) == ["3", "4"]
+    assert sorted(item[2] for item in updates) == ["4", "5"]

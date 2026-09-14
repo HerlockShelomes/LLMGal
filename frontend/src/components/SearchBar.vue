@@ -60,7 +60,7 @@ const handleSearchClick = (e: Event) => {
 }
 
 // 处理点击搜索项
-const handleSelect = (item: { content: string; id: number }) => {
+const handleSelect = (item: { content: string; id: string }) => {
   search.value = item.content
   show.value = false
   
@@ -109,14 +109,14 @@ const handleAsk = async () => {
 }
 
 // 点击外部关闭下拉框
-document.documentElement.addEventListener('click', (e) => {
+const handleDocumentClick = (e: Event) => {
   const target = e.target as HTMLElement
   // 如果点击的是搜索框、对话框或提问按钮，不关闭
   if (target.closest('.search-container') || target.closest('.ask-button')) return
-  
+
   // 只隐藏下拉框，不清除回答内容
   show.value = false
-})
+}
 
 // 处理快捷键
 const handleShortcut = (e: KeyboardEvent) => {
@@ -154,11 +154,14 @@ const handleCodeBlockClick = (event: MouseEvent) => {
 // 组件挂载时添加事件监听
 onMounted(() => {
   document.addEventListener('keydown', handleShortcut)
+  // 全局点击监听必须挂在生命周期里，否则 setup 顶层注册后没有组件实例可以清理
+  document.documentElement.addEventListener('click', handleDocumentClick)
 })
 
 // 组件卸载时移除事件监听
 onUnmounted(() => {
   document.removeEventListener('keydown', handleShortcut)
+  document.documentElement.removeEventListener('click', handleDocumentClick)
 })
 
 // 监听搜索内容变化

@@ -1,13 +1,20 @@
 from __future__ import print_function
-from volcengine.visual.VisualService import VisualService
-import traceback
-import requests
 import os
 import re
+import traceback
 
-# 你的密钥信息
-ACCESS = 'AKLTODlhZDdkMzc3OTU3NGE3Zjk2NWIwODlkNDY2ZDQ1Y2I'
-SECRET = 'T1RrME1HRTFaVFppWkRNMk5EUTJZMkUwTURnMllUUmhNelZoT1dSa01UZw=='
+import requests
+
+import config
+
+# 火山视觉 SDK 属于可选依赖：免费档（CogView-3-Flash）走 OpenAI 兼容 HTTP，
+# 只有 volcengine / seedream 两家才需要它。缺失时置为 None，而不是让导入直接失败。
+try:
+    from volcengine.visual.VisualService import VisualService
+except ImportError:  # pragma: no cover - 取决于运行环境是否安装火山 SDK
+    VisualService = None
+
+# 密钥原先硬编码在此处（缺陷 B01），现统一从 backend/.env 读取，见 config.py
 # 此处的提示词存储规范：绘画基本提示词格式如上。去除Subject_Description、Appearance Details和Expression Adjustment具体的内容，
 # 根据用户对角色的需求填充对应词汇。
 # 所以存储提示词的规范也是，从上至下，Subject Description, Appearance Details 和Expression Adjustment.
@@ -87,6 +94,72 @@ def get_role_image_prompt(role_Name):
 
     return subject_description[0], appearance_details[0]
 
+def _volc_service():
+    """构造并配置火山视觉服务实例。"""
+    if VisualService is None:
+        raise RuntimeError(
+            "未安装 volcengine SDK，无法使用火山图像服务。"
+            "请 pip install volcengine，或把 IMAGE_PROVIDER 改为 zhipu（免费档）。"
+        )
+    service = VisualService()
+    service.set_ak(config.IMAGE_VOLC_ACCESS_KEY)
+    service.set_sk(config.IMAGE_VOLC_SECRET_KEY)
+    return service
+
+
+def _openai_image_payload():
+    """返回 (endpoint, model, api_key)，按 config.IMAGE_PROVIDER 选择。"""
+    if config.IMAGE_PROVIDER == "seedream":
+        # 火山方舟 Seedream（OpenAI 兼容），质量更好但按张计费
+        return (
+            f"{config.IMAGE_ARK_BASE_URL.rstrip('/')}/images/generations",
+            config.IMAGE_ARK_MODEL,
+            config.IMAGE_ARK_API_KEY,
+        )
+    # 默认：智谱 CogView-3-Flash，免费出图
+    return (
+        f"{config.IMAGE_ZHIPU_BASE_URL.rstrip('/')}/images/generations",
+        config.IMAGE_ZHIPU_MODEL,
+        config.IMAGE_ZHIPU_API_KEY,
+    )
+
+
+def generate_image_openai_compatible(prompt, save_path):
+    """OpenAI 兼容文生图（智谱 CogView / 火山 Seedream）。
+
+    与火山 VisualService 的区别：不需要安装厂商 SDK，一个 HTTP 调用即可，
+    且智谱 CogView-3-Flash 属于免费档，适合测试期跑通流程。
+    """
+    endpoint, model, api_key = _openai_image_payload()
+    if not api_key:
+        raise RuntimeError(
+            f"未配置图像服务密钥（IMAGE_PROVIDER={config.IMAGE_PROVIDER}）。"
+            f"请在 backend/.env 填写对应 API Key，详见 .env.example。"
+        )
+
+    response = requests.post(
+        url=endpoint,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"model": model, "prompt": prompt, "size": config.IMAGE_ZHIPU_SIZE},
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = (payload.get("data") or [{}])[0]
+    image_url = data.get("url") or ""
+    if not image_url and data.get("b64_image"):
+        # 少部分网关只回 base64
+        import base64
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "wb") as file:
+            file.write(base64.b64decode(data["b64_image"]))
+        return ""
+    if not image_url:
+        raise RuntimeError(f"图像服务未返回图片地址：{payload}")
+    save_image_from_url(image_url, save_path)
+    return image_url
+
+
 def original_image_generation (nameRole, imgEmo, i):
 
     subject, appearance = get_role_image_prompt(nameRole)
@@ -107,32 +180,31 @@ def original_image_generation (nameRole, imgEmo, i):
     """
     savePath = f"../frontend/src/assets/pictures/{nameRole}/{nameRole}_{i}.jpg"
 
-    visual_service = VisualService()
+    # 火山 VisualService 走原路径；其余（智谱 / Seedream）走 OpenAI 兼容 HTTP。
+    if config.IMAGE_PROVIDER == "volcengine":
+        visual_service = _volc_service()
 
-    # call below method if you don't set ak and sk in $HOME/.volc/config
-    visual_service.set_ak(ACCESS)
-    visual_service.set_sk(SECRET)
+        # 请求Body(查看接口文档请求参数-请求示例，将请求参数内容复制到此)
+        form = {
+        "req_key":"high_aes_general_v20_L",
+        "prompt":original_prompt,
+        "seed":-1,
+        "scale":3.5,
+        "ddim_steps":16,
+        "width":512,
+        "height":512,
+        "use_sr":True,
+        "use_pre_llm": True,
+        "return_url":True
 
-    # 请求Body(查看接口文档请求参数-请求示例，将请求参数内容复制到此)
-    form = {
-    "req_key":"high_aes_general_v20_L",
-    "prompt":original_prompt,
-    "seed":-1,
-    "scale":3.5,
-    "ddim_steps":16,
-    "width":512,
-    "height":512,
-    "use_sr":True,
-    "use_pre_llm": True,
-    "return_url":True
+        }
+        resp = visual_service.cv_process(form)
+        print(resp)
+        image_url = resp['data']['image_urls'][0]
+        save_image_from_url(image_url, savePath)
+        return image_url
 
-    }
-    resp = visual_service.cv_process(form)
-    print(resp)
-    image_url = resp['data']['image_urls'][0]
-    save_image_from_url(image_url, savePath)
-    
-    return image_url
+    return generate_image_openai_compatible(original_prompt, savePath)
 
 
 def emotional_bro(imaurl, nameRole, emotion, i, modelValue):
@@ -159,12 +231,10 @@ def emotional_bro(imaurl, nameRole, emotion, i, modelValue):
     savePath = f"../frontend/src/assets/pictures/{nameRole}/{nameRole}_{i}.jpg"
     saveUrl = ""
 
-    visual_service = VisualService()
-
-    visual_service.set_ak(ACCESS)
-    visual_service.set_sk(SECRET)
-
-
+    # 只有火山系的图生图模型才需要 VisualService；免费档（CogView）走 HTTP，
+    # 延迟到真正需要时再构造，避免没有 SDK 时连导入都失败。
+    if modelValue in ("high_aes_ip_v20", "byteedit_v2.0"):
+        visual_service = _volc_service()
 
     if modelValue == "high_aes_ip_v20":
         # 请求Body(查看接口文档请求参数-请求示例，将请求参数内容复制到此)
@@ -233,23 +303,38 @@ def static_images (roleCall, pic2picValue):
         f"{roleCall}_{emo_image[5][0]}.jpg",
         f"{roleCall}_{emo_image[6][0]}.jpg"
     }
-    # 定义静态资源图片名称无序集合
+    # 定义静态资源图片名称无序集合（顺序固定：neutral, happy, sad, fear, angry, surprised, shy）
+    image_files = {f"{roleCall}_{emo}.jpg" for emo, _desc in emo_image}
+    # 已存在的文件与要求文件的交集
     shared_files = image_files.intersection(files)
-    # 确认静态资源能否对应
-    if (len(shared_files) != 7):
-    # 对应不上时，进行一轮重生成
-    # 一般而言问题都是生成少了，比如服务器繁忙导致的图片资源丢失？
-    # 静态图片文件资源有没有可能更多呢？比如由于服务器繁忙导致的反复生成问题？
-        print("静态资源缺少，重新生成中...")
-        ori_image_url = original_image_generation(roleCall, emo_image[0][1], emo_image[0][0])
-        for i in range(1, 7):
-            emotional_bro(ori_image_url, roleCall, emo_image[i], emo_image[i][0], pic2picValue)
-        print("static images generated successfully.")
-        return ori_image_url
 
-    print("static images already exist.")
-    return ""
-    # 确保前端存储url时，存在前置判断条件：url不为空。
+    if len(shared_files) == len(image_files):
+        print("static images already exist.")
+        return ""
+
+    # 缺陷 B05：原先只要缺一张就把 7 张全部重生成，一次误判就是 7 张图的钱。
+    # 现在只补缺失的那几张，且优先以已有的基准图作为风格参考。
+    missing = [emo for emo, _desc in emo_image if f"{roleCall}_{emo}.jpg" not in shared_files]
+    print(f"静态资源缺少 {len(missing)} 张: {missing}，只补生成缺失部分...")
+
+    generated_url = ""
+    base_url = ""
+    for emo, desc in emo_image:
+        if emo not in missing:
+            continue
+        if base_url:
+            # 已有基准图 URL：走图生图，风格与基准图保持一致
+            url = emotional_bro(base_url, roleCall, [emo, desc], emo, pic2picValue)
+        else:
+            # 还没有可用参考图：先出一张基准图（通常以 neutral 打头）
+            url = original_image_generation(roleCall, desc, emo)
+            base_url = url or base_url
+        generated_url = generated_url or url
+
+    print("static images generated successfully.")
+    return generated_url
+    # 注意：返回空串表示「本次没有新生成图片」，调用方（Integration）不应
+    # 用空串覆盖 Records 中已有的 Recent_Url —— 那是缺陷 B07。
 
 if __name__ == '__main__':
     # roleCall = "GirlProgrammer"

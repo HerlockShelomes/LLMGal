@@ -1,12 +1,17 @@
 <script setup lang="ts">
-import {reactive, computed, ref, watchEffect, watch} from 'vue'
+import {reactive, computed, ref, watchEffect} from 'vue'
 import {
   useSettingsStore,
   useModelOptions,
   type ModelOption,
   useRoleOptions,
   getImageUrl,
+  getDescriptionFile,
+  getTestAudioUrls,
+  ROLE_VOICE_LABELS,
 } from '../stores/settings.ts'
+// 全局单一发声通道：试听音与 ChatView 的对话语音互斥
+import {claimPlayback} from '../utils/audioBus.ts'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Edit, Delete, Plus, InfoFilled } from '@element-plus/icons-vue'
 import { ElTooltip } from 'element-plus'
@@ -106,25 +111,9 @@ const checkModelValueExists = (value: string, excludeValue?: string) => {
   return ''
 }
 
-const checkRoleOverlap = (value: string, excludeValue?: string) => {
-  const defaultRoleOverlap = roleOptions.value
-      .filter(role => !settingsStore.customRoles.includes(role))
-      .some(role => role.value === value)
-
-  if (defaultRoleOverlap) {
-    return '角色名称重复'
-  }
-
-  //检查排除当前角色后是否与其他自定义角色重复：
-  const customRoleOverlap = settingsStore.customRoles
-      .some(role => role.value === value && role.value !== excludeValue)
-
-  if (customRoleOverlap) {
-    return '角色名称出现重复'
-  }
-
-  return ''
-}
+// 已删除 checkRoleOverlap：该函数从未被任何地方调用（无自定义角色新增入口会用到它），
+// 在 vue-tsc 的 noUnusedLocals 下直接让 npm run build 失败。
+// 后续若要支持"新增自定义角色"，在这里照 checkModelOverlap 的写法接上即可。
 
 // 处理深色模式切换
 const handleDarkModeChange = () => {
@@ -346,27 +335,14 @@ const handleImageError = () => {
 const content = ref<string>('')
 const errorMessage = ref<string>('')
 
-const getRoleDocPath = (role_name: string) => {
-
-  const basePath = import.meta.env.DEV
-  ? new URL(`/src/assets/roles`, import.meta.url).href
-  : '/assets/roles'
-
-  return `${basePath}/${role_name}.txt`
-}
-
-//如果部署到服务器上，这里这段代码应当如何修改？
-// const serverSideFetch = async (path: string) => {
-//   const fs = await import('node.fs/promises')
-//   return fs.readFile(new URL(path).pathname, 'utf-8')
-// }
-//服务器处理逻辑之后再确定。
-
+// 角色立绘：getImageUrl 在资源缺失时返回空串，据此判断是否显示占位符
+const roleImageUrl = computed(() => getImageUrl(settings.RoleConfig.roleName, 'neutral'))
+const roleDocUrl = computed(() => getDescriptionFile(settings.RoleConfig.roleName))
 
 watchEffect(async () => {
   const currentRole = settings.RoleConfig.roleName
   try {
-    const docContent = await fetch(getRoleDocPath(currentRole))
+    const docContent = await fetch(roleDocUrl.value)
             .then(read => read.ok ? read.text():Promise.reject('文档不存在'))
     content.value = docContent
     errorMessage.value = ''
@@ -377,25 +353,80 @@ watchEffect(async () => {
 
 })
 
-const getAudioUrl = (roleName: string) => {
-  return new URL(`/src/assets/voice/${roleName}/${roleName}_test.mp3`, import.meta.url).href
-}
+// 常驻的单一音频元素：不再用 :key 重建（旧元素被移除后仍可能继续发声，
+// 与对话语音叠在一起）。角色切换时在 play() 里手动改 src + load() 即可。
+const audio = ref<HTMLAudioElement | null>(null)
 
-const audio = ref()
-const audioKey = ref(0)
-
-const currentAudioUrl = computed(() =>
-  getAudioUrl(settings.RoleConfig.roleName)
+// 仅用于展示：真正发声用的是 backend/config.py 的 ROLE_VOICES
+const currentVoiceLabel = computed(
+  () => ROLE_VOICE_LABELS[settings.RoleConfig.roleName] ?? '未配置（沿用默认音色）'
 )
 
-watch(() => settings.RoleConfig.roleName, (newRole) => {
-  audioKey.value++
-})
+// 试听播放令牌：换角色/重复点击时作废上一次的在途回调
+let testPlayToken = 0
 
 const play = () => {
-  if (audio.value) {
-      audio.value.play()
+  const el = audio.value
+  if (!el) return
+
+  const urls = getTestAudioUrls(settings.RoleConfig.roleName)
+  if (!urls.length) {
+    ElMessage.warning('没有找到该角色的试听音频，请重新生成后再试')
+    return
   }
+
+  // 抢占全局发声通道：正在播放的对话语音会被停掉，反之亦然
+  claimPlayback(el)
+
+  const token = ++testPlayToken
+  let index = 0
+
+  const attempt = () => {
+    if (token !== testPlayToken) return
+    if (index >= urls.length) {
+      console.warn('[试听] 候选地址全部加载失败：', urls)
+      ElMessage.warning('试听音频加载失败，请检查资源文件是否存在')
+      return
+    }
+    const url = urls[index++]
+    let settled = false
+
+    // 该地址不可用（例如 dev 直连的 wav 还没生成）：换下一个候选
+    el.addEventListener('error', () => {
+      if (token !== testPlayToken || settled) return
+      settled = true
+      console.warn('[试听] 资源加载失败，换下一个候选地址：', url)
+      attempt()
+    }, { once: true })
+
+    // 与 ChatView 同理：只赋值 src 不 load() 可能永远不加载；
+    // load() 之后 readyState 会回到 HAVE_NOTHING，必须等到有数据再 play()，
+    // 否则 play() 会被浏览器静默拒绝（表现为「点了没声」）。
+    // 带时间戳：试听样本可能被重新生成过，不破缓存会听到旧音色。
+    const sep = url.includes('?') ? '&' : '?'
+    el.src = `${url}${sep}_t=${Date.now()}`
+    el.load()
+
+    const deadline = Date.now() + 5000
+    const waitForData = () => {
+      if (token !== testPlayToken || settled) return
+      if (el.readyState >= 2 /* HAVE_CURRENT_DATA */) {
+        el.play()?.catch((error: unknown) => {
+          console.warn('[试听] 播放被拦截: ', error)
+          ElMessage.warning('浏览器拦截了自动播放，点击页面任意位置后再试一次')
+        })
+        return
+      }
+      if (Date.now() >= deadline) {
+        console.warn(`[试听] 等待数据超时: readyState=${el.readyState} src=${el.src}`)
+        return
+      }
+      window.setTimeout(waitForData, 150)
+    }
+    window.setTimeout(waitForData, 150)
+  }
+
+  attempt()
 }
 
 
@@ -632,21 +663,20 @@ const clickAudio = () => {
 
         <div class="function-box avatar-box">
           <img
-              :src="getImageUrl(settings.RoleConfig.roleName,'neutral')"
+              :src="roleImageUrl"
               alt="角色形象"
               class="role-avatar"
               @error="handleImageError"
           >
-          <div v-if="!getImageUrl(settings.RoleConfig.roleName,'neutral')" class="avatar-placeholder">
+          <div v-if="!roleImageUrl" class="avatar-placeholder">
             显示失败
             <i class="el-icon-picture-outline"></i>
           </div>
         </div>
 
         <div>这个角色在向你打招呼</div>
-        <audio ref="audio" :key="audioKey">
-          <source :src="currentAudioUrl" type="audio/mpeg" />
-        </audio>
+        <div class="voice-label">音色：{{ currentVoiceLabel }}</div>
+        <audio ref="audio" preload="auto" />
 
         <el-button class="play-button"
         @click="clickAudio()"
@@ -933,6 +963,12 @@ pre {
   align-items: center;
   gap: 1rem;
   margin-top: 0.5rem;
+}
+
+.voice-label {
+  margin: 4px 0 8px;
+  font-size: 12px;
+  opacity: 0.7;
 }
 
 .play-button {

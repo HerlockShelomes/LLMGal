@@ -1,5 +1,9 @@
 import {ref, reactive, onUnmounted} from "vue";
 import { LLMClient} from "./ClientChat.ts";
+import type { HistoryMessage } from "../utils/MessageType.ts";
+
+//多轮上下文保留的最近消息条数（20 轮 = 20 组 user + assistant）
+const HISTORY_MESSAGE_LIMIT = 40;
 
 type MessageStatus = 'sending' | 'received' | 'error';
 
@@ -12,6 +16,8 @@ interface ChatMessage {
         modelText?:string;
         voiceCate?: string;
         modelImage?: string;
+        role_name?: string;
+        realTime?: boolean;
         index?: string;
         emotion?: string;
         progress?: number;
@@ -36,6 +42,16 @@ export default function useChatClient() {
     const selectedRole = ref("Wendy");
     const realTime = ref(false);
     const error = ref<string | null>(null);
+
+    //同一会话的多轮请求共用一个 sessionId，便于后端按会话组织上下文
+    const sessionId = ref<string>(crypto.randomUUID());
+
+    //从已完成的消息里取最近 N 条作为上下文，时间正序、不含当前这条
+    const buildHistory = (): HistoryMessage[] =>
+        messages
+            .filter(m => m.status === 'received' && m.text.trim())
+            .slice(-HISTORY_MESSAGE_LIMIT)
+            .map(m => ({ role: m.role, content: m.text.trim() }));
 
     const initialize = async () => {
         try {
@@ -74,13 +90,16 @@ export default function useChatClient() {
         try {
             const response = await client.sendQuery({
                 textModel_config: {
-                    text: currentInput,
+                    //契约要求 text 是 {role, content} 消息对象，不能是裸字符串
+                    text: { role: 'user', content: currentInput },
                     modelText: selectedTextModel.value,
                 },
                 role: selectedRole.value,   //角色选择
-                imageMode_config: {
+                history: buildHistory(),
+                sessionId: sessionId.value,
+                imageModel_config: {
                     modelImage: selectedImageModel.value,
-                    realTimeRendering: realTime,
+                    realTimeRendering: realTime.value,
                 },
                 voiceCate: selectedVoiceCate.value,
                 onProgress: (percent) => {
@@ -102,14 +121,14 @@ export default function useChatClient() {
                 }
             });
         } catch (err) {
-            handleError(err.message);
+            handleError(err);
             updateMessageStatus(userMessageID, 'error');
         }
     };
 
     const updateMessageProgress = (messageID: string, progress: number) => {
         const message = messages.find(m => m.message_id === messageID);
-        if (message) {
+        if (message?.metadata) {
             message.metadata.progress = progress;
         }
     };
@@ -121,8 +140,11 @@ export default function useChatClient() {
         }
     };
 
-    const handleError = (error, msg: string) => {
-        error.value = msg;
+    //msg 用于覆盖默认文案；缺省时从 error 本身取信息
+    const handleError = (err: unknown, msg?: string) => {
+        const text = msg
+            ?? (err instanceof Error ? err.message : typeof err === 'string' ? err : '未知错误');
+        error.value = text;
         setTimeout(() => error.value = null, 5000);
     };
 

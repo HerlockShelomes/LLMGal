@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { Fold, Expand, Plus, Delete, Edit } from '@element-plus/icons-vue'
 import { useChatStore } from '../stores/chat'
-import { ElMessageBox } from 'element-plus'
+import { ElInput, ElMessageBox } from 'element-plus'
 
 const isCollapsed = ref(false)
 const chatStore = useChatStore()
@@ -12,6 +12,16 @@ const activeId = computed(() => chatStore.activeConversationId)
 
 const editingId = ref<string | null>(null)
 const editTitle = ref('')
+// 模板里的 ref="editInputRef" 在 v-for 中会被收集成数组，用联合类型兼容两种情况
+const editInputRef = ref<InstanceType<typeof ElInput> | InstanceType<typeof ElInput>[] | null>(null)
+// Esc 取消时会先置空 editingId 让输入框卸载，卸载又可能触发 blur 再保存一次，
+// 用这个标记把由取消引起的 blur 挡掉
+const isCancelling = ref(false)
+
+const focusEditInput = () => {
+  const target = Array.isArray(editInputRef.value) ? editInputRef.value[0] : editInputRef.value
+  target?.focus?.()
+}
 
 const toggleSidebar = () => {
   isCollapsed.value = !isCollapsed.value
@@ -38,13 +48,22 @@ const deleteConversation = async (id: string) => {
   }
 }
 
-const startRename = (conv: { id: string, title: string }, event: Event) => {
+const startRename = async (conv: { id: string, title: string }, event: Event) => {
   event.stopPropagation()
+  isCancelling.value = false
   editingId.value = conv.id
   editTitle.value = conv.title
+  // 等输入框渲染出来再聚焦
+  await nextTick()
+  focusEditInput()
 }
 
 const saveRename = (conv: { id: string }) => {
+  // 由 Esc 取消引发的 blur 不应再保存一次
+  if (isCancelling.value) {
+    isCancelling.value = false
+    return
+  }
   if (editTitle.value.trim()) {
     const conversation = chatStore.conversations.find(c => c.id === conv.id)
     if (conversation) {
@@ -55,14 +74,16 @@ const saveRename = (conv: { id: string }) => {
 }
 
 const cancelRename = () => {
+  isCancelling.value = true
   editingId.value = null
 }
 
-const handleRenameKeydown = (conv: { id: string }, event: KeyboardEvent) => {
-  if (event.key === 'Enter') {
-    event.preventDefault()
+const handleRenameKeydown = (conv: { id: string }, event: Event) => {
+  const keyboardEvent = event as KeyboardEvent
+  if (keyboardEvent.key === 'Enter') {
+    keyboardEvent.preventDefault()
     saveRename(conv)
-  } else if (event.key === 'Escape') {
+  } else if (keyboardEvent.key === 'Escape') {
     cancelRename()
   }
 }
@@ -89,7 +110,7 @@ const handleRenameKeydown = (conv: { id: string }, event: KeyboardEvent) => {
           <el-input
             v-model="editTitle"
             size="small"
-            @keydown="(e: KeyboardEvent) => handleRenameKeydown(conv, e)"
+            @keydown="(e: Event) => handleRenameKeydown(conv, e)"
             @blur="saveRename(conv)"
             ref="editInputRef"
           />

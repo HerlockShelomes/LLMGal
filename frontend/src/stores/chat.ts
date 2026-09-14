@@ -3,13 +3,41 @@ import { defineStore } from 'pinia'
 
 // 定义消息类型
 interface Message {
-  id: number
+  id: string
   timestamp: string
   role: 'user' | 'assistant'
   content: string
   reasoning_content?: string
   hasImage?: boolean
 }
+
+// 生成唯一ID：Date.now() 在同一毫秒内的连续操作会碰撞（消息 id 撞车会导致删除/重发错位）。
+// crypto.randomUUID 在非安全上下文（http 访问）下不可用，故保留降级实现。
+const generateId = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+// 内联在 content 里的 base64 图片
+const INLINE_IMAGE = /!\[[^\]]*\]\((data:image\/[a-zA-Z0-9.+-]+;base64,[^)]*)\)/g
+
+// 持久化前剥离 base64：一张图动辄几 MB，全部写进 localStorage（上限约 5MB）
+// 会直接把存储写满并让后续写入抛 QuotaExceededError，整个会话历史都存不进去。
+const stripImages = (state: ChatState): ChatState => ({
+  ...state,
+  conversations: state.conversations.map(conversation => ({
+    ...conversation,
+    messages: conversation.messages.map(message => ({
+      ...message,
+      content: typeof message.content === 'string'
+        ? message.content.replace(INLINE_IMAGE, '（图片内容未保存）')
+        : message.content,
+      hasImage: message.hasImage ? false : message.hasImage,
+    })),
+  })),
+})
 
 // 定义Token计数类型
 interface TokenCount {
@@ -58,7 +86,7 @@ export const useChatStore = defineStore('chat', {
     createConversation() {
       this.conversationCounter++
       const conversation: Conversation = {
-        id: Date.now().toString(),
+        id: generateId(),
         title: `新会话 ${this.conversationCounter}`,
         messages: [],
         createdAt: new Date().toISOString(),
@@ -103,12 +131,43 @@ export const useChatStore = defineStore('chat', {
       )
       if (conversation) {
         conversation.messages.push({
-          id: Date.now(),
+          id: generateId(),
           timestamp: new Date().toISOString(),
           ...message
         })
         conversation.updatedAt = new Date().toISOString()
       }
+    },
+
+    // 按 id 精确删除一条消息
+    deleteMessage(id: string) {
+      const conversation = this.conversations.find(
+        conv => conv.id === this.activeConversationId
+      )
+      if (!conversation) return
+      const index = conversation.messages.findIndex(m => m.id === id)
+      if (index === -1) return
+      conversation.messages.splice(index, 1)
+      conversation.updatedAt = new Date().toISOString()
+    },
+
+    // 成对删除一条消息及其紧跟的助手回复。
+    // 按 id 定位而不是假定 user/assistant 一定相邻后 splice(index, 2)，
+    // 后者在消息被编辑、删除或插入系统消息后会误删下一条无关消息。
+    deleteMessagePair(id: string) {
+      const conversation = this.conversations.find(
+        conv => conv.id === this.activeConversationId
+      )
+      if (!conversation) return
+      const index = conversation.messages.findIndex(m => m.id === id)
+      if (index === -1) return
+
+      const target = conversation.messages[index]
+      const next = conversation.messages[index + 1]
+      const isPair = target.role === 'user' && next?.role === 'assistant'
+
+      conversation.messages.splice(index, isPair ? 2 : 1)
+      conversation.updatedAt = new Date().toISOString()
     },
 
     // 更新正在生成回答的会话的最后一条消息
@@ -193,6 +252,11 @@ export const useChatStore = defineStore('chat', {
 
   persist: {
     key: 'ai-chat-history',
-    storage: localStorage
+    storage: localStorage,
+    // 写盘时剥离 base64 图片，只保留文本与必要元数据
+    serializer: {
+      serialize: (state) => JSON.stringify(stripImages(state as unknown as ChatState)),
+      deserialize: (value) => JSON.parse(value),
+    },
   },
 })

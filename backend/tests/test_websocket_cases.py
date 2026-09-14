@@ -151,7 +151,9 @@ async def test_tc_ws_04_non_client_query_rejected_without_side_effect(monkeypatc
         Connect, "process_query", lambda request: calls.append(request) or fixed_response()
     )
     wrong = valid_message()
-    wrong["type"] = "canceled_request"
+    # 注意：canceled_request 已被后端作为控制帧处理（用户中止），
+    # 这里换一个真正未知的类型来验证"非法类型被拒绝且连接可复用"。
+    wrong["type"] = "unknown_message_type"
     websocket = await run_socket(
         [wrong, valid_message(), {"message_id": "msg-001"}], monkeypatch
     )
@@ -197,19 +199,25 @@ async def test_tc_ws_07_missing_required_payload_field(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tc_ws_08_error_response_is_frontend_incompatible():
-    """TC-WS-08：记录当前错误响应不符合前端 server-message 契约。"""
+async def test_tc_ws_08_error_response_matches_frontend_contract():
+    """TC-WS-08：错误响应必须满足前端 server-message 契约。"""
     websocket = QueueWebSocket()
-    await Connect.send_error(websocket, "JSON_PARSE_ERROR", "fixed detail")
+    await Connect.send_error(
+        websocket, "JSON_PARSE_ERROR", "fixed detail", message_id="msg-008"
+    )
     error = websocket.sent[0]
     assert {"type", "code", "message", "detail"} <= error.keys()
     frontend_required = {"type", "message_id", "status", "payload"}
-    assert not frontend_required <= error.keys()
+    assert frontend_required <= error.keys()
+    assert error["status"] == "error"
+    assert error["message_id"] == "msg-008"
+    assert error["payload"]["code"] == "JSON_PARSE_ERROR"
+    assert error["payload"]["detail"] == "fixed detail"
 
 
 @pytest.mark.asyncio
 async def test_tc_cfg_01_missing_model_text_reports_processing_errors(monkeypatch):
-    """TC-CFG-01：缺少 modelText，不调用 LLM，并观察双错误响应。"""
+    """TC-CFG-01：缺少 modelText，不调用 LLM，且只回一条错误响应。"""
     external_calls = []
     monkeypatch.setattr(
         Connect, "Response_Collection", lambda *_args: external_calls.append(True)
@@ -217,16 +225,15 @@ async def test_tc_cfg_01_missing_model_text_reports_processing_errors(monkeypatc
     message = valid_message()
     del message["payload"]["textModel_config"]["modelText"]
     websocket = await run_socket([message], monkeypatch)
-    assert [item["code"] for item in websocket.sent] == [
-        "PROCESS_ERROR",
-        "SERVER_ERROR",
-    ]
+    # 修复后：处理失败只发一条错误响应，且带回请求的 message_id。
+    assert [item["code"] for item in websocket.sent] == ["PROCESS_ERROR"]
+    assert websocket.sent[0]["message_id"] == message["message_id"]
     assert external_calls == []
 
 
 @pytest.mark.asyncio
 async def test_tc_cfg_02_missing_realtime_flag_reports_processing_errors(monkeypatch):
-    """TC-CFG-02：缺少 realTimeRendering，不调用 LLM，并观察双错误响应。"""
+    """TC-CFG-02：缺少 realTimeRendering，不调用 LLM，且只回一条错误响应。"""
     external_calls = []
     monkeypatch.setattr(
         Connect, "Response_Collection", lambda *_args: external_calls.append(True)
@@ -234,16 +241,15 @@ async def test_tc_cfg_02_missing_realtime_flag_reports_processing_errors(monkeyp
     message = valid_message()
     del message["payload"]["imageModel_config"]["realTimeRendering"]
     websocket = await run_socket([message], monkeypatch)
-    assert [item["code"] for item in websocket.sent] == [
-        "PROCESS_ERROR",
-        "SERVER_ERROR",
-    ]
+    # 修复后：处理失败只发一条错误响应，且带回请求的 message_id。
+    assert [item["code"] for item in websocket.sent] == ["PROCESS_ERROR"]
+    assert websocket.sent[0]["message_id"] == message["message_id"]
     assert external_calls == []
 
 
 @pytest.mark.asyncio
 async def test_tc_cfg_06_unknown_model_forwarded_then_rejected(monkeypatch):
-    """TC-CFG-06：未知模型原样透传，服务拒绝后进入错误路径。"""
+    """TC-CFG-06：未知模型原样透传，服务拒绝后只回一条错误响应。"""
     received = []
 
     def reject(model, *_args):
@@ -255,10 +261,9 @@ async def test_tc_cfg_06_unknown_model_forwarded_then_rejected(monkeypatch):
     message["payload"]["textModel_config"]["modelText"] = "not-supported-model"
     websocket = await run_socket([message], monkeypatch)
     assert received == ["not-supported-model"]
-    assert [item["code"] for item in websocket.sent] == [
-        "PROCESS_ERROR",
-        "SERVER_ERROR",
-    ]
+    # 修复后：提供方拒绝只产生一条 PROCESS_ERROR，不再被外层兜底成第二条 SERVER_ERROR。
+    assert [item["code"] for item in websocket.sent] == ["PROCESS_ERROR"]
+    assert websocket.sent[0]["message_id"] == message["message_id"]
 
 
 @pytest.mark.asyncio
@@ -314,11 +319,11 @@ async def test_tc_ack_02_timeout_allows_next_request(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tc_ack_03_next_query_is_consumed_as_ack(monkeypatch):
-    """TC-ACK-03：未 ACK 时下一业务请求被当前实现误当成 ACK。"""
+async def test_tc_ack_03_next_query_is_not_consumed_as_ack(monkeypatch):
+    """TC-ACK-03：未 ACK 时下一条业务请求不被吞掉，仍被正常处理。"""
     websocket = await run_socket(
         [valid_message("m1"), valid_message("m2")],
         monkeypatch,
         fixed_response(),
     )
-    assert [item["message_id"] for item in websocket.sent] == ["m1"]
+    assert [item["message_id"] for item in websocket.sent] == ["m1", "m2"]

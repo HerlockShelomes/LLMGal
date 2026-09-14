@@ -2,6 +2,7 @@ import asyncio
 import websockets
 import json
 from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import time
 from fastapi.encoders import jsonable_encoder
@@ -11,6 +12,9 @@ from Integration import Response_Collection
 import logging
 from websockets.exceptions import ConnectionClosedError
 from Voice import parse_response
+
+import config
+import Text
 
 # 连接管理器
 class WebSocketManager:
@@ -39,7 +43,7 @@ async def inner_websocket_operation(api_url, full_client, file_to_save):
     """隔离的内层WebSocket调用"""
     try:
         conn_id = await ws_manager.connect_inner(api_url,
-        {"Authorization": "Bearer; _SRNKZhKXevBrx72wklF-D8NX7LGigGs"}
+        {"Authorization": f"Bearer; {config.TTS_VOLC_TOKEN}"}
         )
         inner_ws = ws_manager.active_connections[conn_id]
 
@@ -123,7 +127,27 @@ async def inner_websocket_operation(api_url, full_client, file_to_save):
 # }
 # 好像还没写，后续看能不能完善一下。
 
-app = FastAPI(title  = "LLM Galgame Chat Backend")
+app = FastAPI(title="LLM Galgame Chat Backend")
+
+# 跨域：默认放行方便本地开发；生产请在 .env 里把 CORS_ALLOW_ORIGINS 收敛成前端域名。
+_origins = [item.strip() for item in config.CORS_ALLOW_ORIGINS.split(",") if item.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins or ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def _startup_check():
+    """启动时自检配置，避免"跑起来了才发现没填密钥"。"""
+    print("[LLMGal] 当前配置：")
+    print(config.describe())
+    if not config.WS_AUTH_TOKEN:
+        print("[LLMGal] 警告：未设置 WS_AUTH_TOKEN，WebSocket 处于无鉴权状态，"
+              "任何能访问该端口的人都能消耗你的 API 额度。请在 .env 中配置。")
 
 # 等到基础功能实现之后需要完善每一个消息传输的参数验证逻辑。
 
@@ -142,6 +166,10 @@ class ClientRequest(BaseModel):
     # },
     voiceCate: str
     # "voiceCate": "GirlFriend"    //选择模型使用的音色
+    # 多轮上下文：历史消息列表 [{role, content}, ...]，按时间正序，不含当前这条。
+    history: list = []
+    # 会话标识，便于日志追踪（不参与生成）。
+    sessionId: str = ""
 
     # BaseModel是已经包含基本的type, message_id, timestamp, status信息了吗？
     # 为什么我们构建的时候好像只需要考虑payload里的信息呢？
@@ -162,6 +190,8 @@ class ServerResponse(BaseModel):
     imageUrl: str
     # imageUrl: "https://xxxx.com" // 更新的图片url，现在传入可能意义不大，因为提取、写入、更新这几步，全是在后端完成。但保留这一项，
     #                              // 后续如果用户希望进一步节省内存，可以直接调用url。url失效时图片会消失，就调用文生图模型重新生成。
+    # success / partial：语音或图片任一失败时降级为 partial（缺陷 009）
+    status: str = "success"
 
 def process_query(request: ClientRequest) -> ServerResponse:
     """
@@ -180,21 +210,31 @@ def process_query(request: ClientRequest) -> ServerResponse:
     try:
         startTime = time.time()
 
-
-        response, indexStr, imageEmo, recentUrl = Response_Collection(request.textModel_config["modelText"],
+        # 第 7 个参数把多轮历史交给编排层，否则模型永远只看得到当前这一句。
+        response, indexStr, imageEmo, recentUrl, proc_status = Response_Collection(
+                                                                      request.textModel_config["modelText"],
                                                                       request.imageModel_config["modelImage"],
                                                                       request.role,
                                                                       request.voiceCate,
                                                                       request.imageModel_config["realTimeRendering"],
-                                                                      request.textModel_config["text"])
+                                                                      request.textModel_config["text"],
+                                                                      request.history)
 
         respond.response = response
         respond.emotion = imageEmo
         respond.index = indexStr
         respond.imageUrl = recentUrl
+        respond.status = proc_status or "success"
         stopTime = time.time()
-        # 这一段metrics尚未增入……后续确定一下
-        respond.metrics["tokens_used"] = len(response)
+        # 优先用模型返回的真实 token 用量；拿不到时退回按中文字符数粗估，
+        # 并在字段上标注 est_ 前缀，避免把估算值当成真实用量。
+        usage = getattr(Text, "LAST_USAGE", None)
+        if usage and usage.get("total_tokens"):
+            respond.metrics["tokens_used"] = usage["total_tokens"]
+            respond.metrics["tokens_used_est"] = False
+        else:
+            respond.metrics["tokens_used"] = len(response)
+            respond.metrics["tokens_used_est"] = True
         respond.metrics["time_cost"] = stopTime - startTime
         # "metrics": {
         #   "time_cost": 2.34,          // 单位：秒
@@ -205,14 +245,92 @@ def process_query(request: ClientRequest) -> ServerResponse:
         logging.error(f"处理请求异常：{str(e)}")
         raise
 
+def _validate_payload(payload) -> str:
+    """校验 payload 的内容合法性，返回失败原因（通过时返回空串）。
+
+    与 Pydantic 的类型校验互补：这里管"字段在但内容不对"的情况，
+    例如 text 不是消息对象、history 不是数组。用独立的 invalid_message
+    类型回给前端，区别于结构性的 VALIDATION_ERROR。
+    """
+    if not isinstance(payload, dict):
+        return "payload 必须是对象"
+
+    text_model = payload.get('textModel_config')
+    if not isinstance(text_model, dict):
+        return "textModel_config 缺失或格式错误"
+    if 'text' not in text_model:
+        return "textModel_config.text 缺失"
+
+    image_model = payload.get('imageModel_config')
+    if not isinstance(image_model, dict):
+        return "imageModel_config 缺失或格式错误"
+
+    history = payload.get('history')
+    if history is not None:
+        if not isinstance(history, list):
+            return "history 必须是消息数组"
+        for item in history:
+            if not isinstance(item, dict) or 'content' not in item:
+                return "history 中每条消息需包含 role 与 content"
+    return ""
+
+
 @app.get("/")
 def health_check():
     return {"status": "alive"}
 
+
+@app.get("/health/config")
+def config_check():
+    """启动自检：告诉前端/运维当前用的是哪套模型、还缺哪些密钥（不返回密钥本身）。"""
+    return {
+        "status": "alive",
+        "text_provider": config.TEXT_PROVIDER,
+        "text_model": config.TEXT_MODEL,
+        "tts_provider": config.TTS_PROVIDER,
+        "image_provider": config.IMAGE_PROVIDER,
+        "auth_enabled": bool(config.WS_AUTH_TOKEN),
+        "missing": config.missing_credentials(),
+    }
+
+@app.get("/voices")
+def list_voices():
+    """音色目录 + 角色->音色映射，供前端设置面板展示与微调。"""
+    return {
+        "provider": config.TTS_PROVIDER,
+        "catalog": [
+            {"id": voice_id, "name": info[0], "gender": info[1], "desc": info[2]}
+            for voice_id, info in config.QWEN_VOICE_CATALOG.items()
+        ],
+        "role_voices": config.ROLE_VOICES,
+    }
+
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
+
+    # 缺陷 B02：可选的接入鉴权。配置了 WS_AUTH_TOKEN 之后，连接必须带同名 token，
+    # 否则任何人都能连上来消耗你的免费额度。未配置时保持开发模式（启动会告警）。
+    if config.WS_AUTH_TOKEN:
+        query_params = getattr(websocket, "query_params", None)
+        supplied = query_params.get("token") if query_params else None
+        if not supplied:
+            headers = getattr(websocket, "headers", None)
+            if headers:
+                supplied = headers.get("x-auth-token")
+        if supplied != config.WS_AUTH_TOKEN:
+            await send_error(websocket, "AUTH_403", "鉴权失败：token 无效或缺失")
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+            return
+
     try:
+        # 待确认的响应ID。发送响应后记录，下一条消息若是它的回执才消费，
+        # 不是回执就按普通业务请求处理，避免把用户请求当成 ACK 吞掉。
+        pending_ack_id = None
         while True:
             try:
                 # 接收并解析消息
@@ -223,28 +341,92 @@ async def websocket_chat(websocket: WebSocket):
                     await send_error(websocket, "JSON_PARSE_ERROR", str(e))
                     continue
 
-                # 基础验证
-                if message['type'] != 'client_query':
-                    await send_error(websocket, "INVALID_MSG_TYPE", f"Invalid Message Type: {message['type']}")
+                # 先判定是否为上一条响应的确认回执。
+                # 仅当 message_id 与待确认ID一致、且不是新的业务请求时才消费掉；
+                # 否则继续按业务请求处理，避免下一条提问被误当成 ACK 吞掉。
+                if (
+                    pending_ack_id is not None
+                    and message.get('message_id') == pending_ack_id
+                    and message.get('type') != 'client_query'
+                ):
+                    print(f"[确认送达] 消息ID: {pending_ack_id}")
+                    pending_ack_id = None
+                    continue
+
+                # 基础验证（缺 type 会抛 KeyError，交由外层兜底为 SERVER_ERROR）
+                msg_type = message['type']
+                # 心跳与取消属于控制帧，不能当成非法业务消息回错误，
+                # 否则前端每一次心跳都会弹一条错误提示。
+                if msg_type in ('heartbeat', 'ping'):
+                    await websocket.send_json({
+                        "type": "pong",
+                        "message_id": message.get('message_id', ''),
+                        "status": "success",
+                        "payload": {},
+                    })
+                    continue
+                if msg_type == 'canceled_request':
+                    # 用户中止：清掉待确认回执即可，生成中的请求结果到达后由前端自行忽略。
+                    print(f"[取消请求] 消息ID: {message.get('message_id', '')}")
+                    pending_ack_id = None
+                    continue
+
+                if msg_type != 'client_query':
+                    await send_error(
+                        websocket,
+                        "INVALID_MSG_TYPE",
+                        f"Invalid Message Type: {message['type']}",
+                        message_id=message.get('message_id', ''),
+                    )
+                    continue
+
+                # 语义校验：Pydantic 只校验类型，这里再校验内容是否可用。
+                # 与 VALIDATION_ERROR 区分开，用独立的 invalid_message 类型告知前端。
+                payload = message['payload']
+                reason = _validate_payload(payload)
+                if reason:
+                    await websocket.send_json({
+                        "type": "invalid_message",
+                        "message_id": message.get('message_id', ''),
+                        "status": "error",
+                        "reason": reason,
+                        "payload": {"reason": reason},
+                    })
                     continue
 
                 # 执行处理逻辑
                 try:
                     client_request = ClientRequest(**message['payload'])
                 except ValueError as e:
-                    await send_error(websocket, "VALIDATION_ERROR", str(e))
+                    await send_error(
+                        websocket,
+                        "VALIDATION_ERROR",
+                        str(e),
+                        message_id=message.get('message_id', ''),
+                    )
                     continue
                 try:
-                    resp = process_query(client_request)
+                    # 缺陷 B03：Response_Collection 内部是同步的网络调用（LLM/TTS/图像），
+                    # 直接在事件循环里跑会把整个服务阻塞住，并发一超 1 就假死。
+                    # 这里卸载到线程池，事件循环继续处理心跳与取消。
+                    resp = await asyncio.to_thread(process_query, client_request)
                 except Exception as e:
                     logging.error(f'处理查询失败: {str(e)}')
-                    await send_error(websocket, "PROCESS_ERROR", f"处理失败: {str(e)}")
+                    await send_error(
+                        websocket,
+                        "PROCESS_ERROR",
+                        f"处理失败: {str(e)}",
+                        message_id=message.get('message_id', ''),
+                    )
+                    # 处理失败时必须跳出本轮循环，否则 resp 未绑定，
+                    # 下面构造响应消息会再抛 NameError，导致一次失败连发两条错误响应。
+                    continue
 
-                # 构造返回消息
+                # 构造返回消息（状态如实透传：语音/图片失败时为 partial）
                 respond_msg = {
                     "type": "assistant_response",
                     "message_id": message['message_id'],
-                    "status": "success",
+                    "status": getattr(resp, "status", "success") or "success",
                     "payload": {
                         "response": resp.response,
                         "emotion": resp.emotion,
@@ -265,15 +447,10 @@ async def websocket_chat(websocket: WebSocket):
                         continue
                 except Exception as e:
                     print(f'消息发送出错: {str(e)}')
-                try:
-                    ack = await asyncio.wait_for(websocket.receive_json(), timeout = 30)
-                    if ack.get('message_id') == respond_msg['message_id']:
-                        print(f"[确认送达] 消息ID: {respond_msg['message_id']}")
-                    else:
-                        print("ACK不匹配")
-
-                except asyncio.TimeoutError:
-                    print("[未收到ACK] 消息可能没有送达")
+                # 只登记待确认的响应ID，不再阻塞式等待下一条消息。
+                # 原先在此处直接 receive_json() 会把用户紧接着发来的下一条业务
+                # 请求误当成 ACK 消费掉且不重放，导致该请求被永久丢弃。
+                pending_ack_id = respond_msg['message_id']
 
             except WebSocketDisconnect as e:
                 print('客户端断开连接', e)
@@ -287,14 +464,26 @@ async def websocket_chat(websocket: WebSocket):
     #     # 关闭连接，清理缓存
     #     await websocket.close()
 
-async def send_error(websocket: WebSocket, code: str, detail: str = None):
-    # 有一个值得考虑的问题，此处没有附带msg_id，虽然是因为解析错误导致没有可以获取的message_id...
-    # 但是这样，前端要怎么知道是哪条信息解析出错了呢？
+async def send_error(websocket: WebSocket, code: str, detail: str = None, message_id: str = ""):
+    """回传错误消息。
+
+    必须携带 message_id 与 payload：前端的 isServerMessage 会校验
+    type / message_id / payload 三项，缺任一项都会被判为非法消息并丢弃，
+    错误提示根本无法到达用户。顶层同时保留 code/message/detail 以兼容既有消费者。
+    """
+    text = "内部服务器出错。" if code == "SERVER_ERROR" else "请求格式出错。"
     error_msg = {
         "type": "error",
+        "message_id": message_id,
+        "status": "error",
         "code": code,
-        "message": "内部服务器出错。" if code == "SERVER_ERROR" else "请求格式出错。"
+        "message": text,
         # 错误类型后续最好整理一下，暂时考虑的只有这两种。
+        "payload": {
+            "code": code,
+            "message": text,
+            "detail": detail or "",
+        },
     }
 
     #   "type": "error",                            // 消息类型标识符，这一个类型消息指向传输错误；
@@ -312,6 +501,6 @@ async def send_error(websocket: WebSocket, code: str, detail: str = None):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host = "0.0.0.0", port = 8000, reload = True)
-    # import uvloop
-    # uvloop.install()
+    # 默认只监听本机（缺陷 B02）：原先绑定 0.0.0.0 且无鉴权，等于把 API 额度暴露在网络上。
+    # 需要局域网/外网访问时，在 .env 里显式设置 HOST，并务必同时配置 WS_AUTH_TOKEN。
+    uvicorn.run(app, host=config.HOST, port=config.PORT, reload=True)
