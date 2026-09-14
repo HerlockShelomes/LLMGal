@@ -58,81 +58,118 @@ LLMGal/
 
 ## 环境要求
 
-- Python 3.11
-- Node.js 18 或更高版本
+- Python 3.11–3.14（推荐 3.11 或 3.12；不支持 Python 3.10 及更早版本）
+- Node.js 18 或更高版本（建议使用 Node.js LTS）
 - npm 9 或更高版本
 - 可访问所配置文本、语音和图像服务的网络环境
 
+项目不需要 MySQL、Redis 或其他数据库即可体验聊天功能。运行时依赖已与历史开发依赖拆分；首次部署无需安装数据库客户端或 C/C++ 编译工具。
+
 ## 配置说明
 
-完整多模态流程依赖三类第三方服务：OpenAI 兼容的文本模型接口、火山引擎图像服务和语音合成服务。当前原型的服务配置仍分散在 `backend/Text.py`、`backend/Image.py` 和 `backend/Voice.py` 中。
+完整多模态流程依赖文本模型、语音合成与可选的实时图像服务。服务配置统一由 `backend/config.py` 从 `backend/.env` 或系统环境变量读取；环境变量优先于 `.env`，便于本地开发和 CI 部署。
 
 使用前请完成以下工作：
 
-1. 为三类服务准备仅用于开发或测试的凭据。
-2. 将配置改为从环境变量或本地 `.env` 文件读取。
-3. 确保 `.env` 已被 Git 忽略，禁止提交真实密钥。
-4. 对曾经提交到仓库的凭据立即作废并重新生成。
+1. 复制 `backend/.env.example` 为 `backend/.env`，填写仅用于开发或测试的凭据；初始化脚本会在 `.env` 缺失时自动完成复制。
+2. 至少配置一个文本模型密钥；若要听到语音，再配置 TTS 密钥。普通聊天默认使用静态情绪图，未配置图像服务也可体验文本与语音。
+3. `.env` 与 `frontend/.env.local` 已被 Git 忽略，禁止提交真实密钥。
+4. 若启用 `WS_AUTH_TOKEN`，还须将相同值写入 `frontend/.env.local` 的 `VITE_WS_TOKEN`。
 
 前端设置面板中的 API Key 仅供前端直连接口相关功能使用，不能替代后端所需配置。
 
-## 一键部署（推荐）
-
-项目提供了部署脚本，自动创建 Python 3.11 虚拟环境并安装依赖（解释器版本会被脚本校验，非 3.11 会拒绝继续）：
-
-```bash
-# Linux / macOS / Windows(Git Bash)
-bash scripts/setup_env.sh                 # 仅后端运行时依赖
-bash scripts/setup_env.sh --with-test     # 额外安装后端测试依赖
-bash scripts/setup_env.sh --with-frontend # 额外执行前端 npm ci
-```
-
-Windows 用户也可直接双击 `scripts/setup_env.bat`（交互式，按需安装测试/前端依赖）。若想指定已存在的解释器或虚拟环境目录，可用环境变量：
-
-```bash
-LLMGAL_PYTHON=/path/to/python3.11 bash scripts/setup_env.sh
-LLMGAL_ENV_BACKEND=/path/to/venv      bash scripts/setup_env.sh
-```
-
-若想复刻本机名为 `vue-fastapi` 的 Conda 环境，可手动执行：
-
-```bash
-conda create -n vue-fastapi python=3.11 -y
-conda activate vue-fastapi
-pip install -r backend/requirements.txt
-```
-
-> 依赖说明：`backend/requirements.txt` 仅保留后端代码实际 import 的 7 个库（fastapi / starlette / pydantic / uvicorn / websockets / requests / openai）以及 `volcengine` 的其余运行时依赖。`volcengine` 本身由部署脚本以 `pip install --no-deps` 安装——因为它的元数据硬钉 `pycryptodome==3.9.9`（该版本在 CPython 3.11 无预编译轮子、需 VC++ 编译），而 `pycryptodome` 已改为钉带轮子的 `3.21.0`，故绕过其过度钉版本即可全新安装成功（已在干净 venv 实测）。原 `pip freeze` 中约 80% 的包（Flask、SQLAlchemy、redis、loguru 等）均未被项目使用，已移除。
-
 ## 快速开始
 
-### 1. 启动后端
+### 推荐：一键初始化
 
-在仓库根目录执行：
+克隆仓库后，在 **LLMGal 仓库根目录**执行：
 
 ```bash
-cd backend
-python3.11 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-python -m pip install -r requirements.txt
-# volcengine 需以 --no-deps 安装，避开其过度钉的 pycryptodome==3.9.9（cp311 无轮子）
-python -m pip install --no-deps volcengine==1.0.192
-python -m uvicorn Connect:app --reload --host 127.0.0.1 --port 8000
+python scripts/setup_local.py
 ```
 
-后端必须从 `backend` 目录启动，因为当前代码使用了相对于该目录的资源路径。浏览器访问 <http://127.0.0.1:8000/>，返回 `{"status":"alive"}` 表示服务已启动。
+该命令会：
 
-### 2. 启动前端
+1. 校验 Python 版本，并创建或复用 `backend/.venv`；
+2. 安装最小后端运行时依赖，不安装 MySQL/Redis 等无关历史依赖；
+3. 在缺失时从 `.env.example` 创建 `backend/.env`，且绝不覆盖已有本地配置；
+4. 通过 `npm ci` 安装前端锁定依赖。
 
-打开另一个终端：
+常用选项：
 
 ```bash
-cd frontend
-npm ci
-npm run dev
+# 当前 python 不是目标版本时，明确指定解释器
+python scripts/setup_local.py --python python3.11
+
+# 仅部署后端或前端
+python scripts/setup_local.py --backend-only
+python scripts/setup_local.py --frontend-only
+
+# 虚拟环境损坏或切换 Python 主次版本后重建
+python scripts/setup_local.py --recreate-venv
+```
+
+Windows PowerShell / CMD 同样使用：
+
+```powershell
+py scripts\setup_local.py
+```
+
+若 Windows 中 `py` 默认指向不支持的 Python，请指定受支持版本来运行启动器：
+
+```powershell
+py -3.11 scripts\setup_local.py
+```
+
+### 1. 配置本地密钥
+
+打开 `backend/.env`，按注释填写密钥。最小可用组合通常是：
+
+```env
+TEXT_PROVIDER=zhipu
+ZHIPU_API_KEY=你的文本模型开发密钥
+TTS_PROVIDER=qwen
+DASHSCOPE_API_KEY=你的语音服务开发密钥
+```
+
+如果只希望确认服务能启动、不发起聊天请求，也可以暂不填写密钥。服务启动后会在控制台及 `/health/config` 中报告缺失项，但不会打印密钥内容。
+
+### 2. 启动后端
+
+在仓库根目录打开终端 A：
+
+```bash
+python scripts/start_backend.py
+```
+
+启动脚本会自动使用 `backend/.venv`，并从正确的 `backend` 工作目录运行，避免相对资源路径错误。浏览器访问：
+
+- <http://127.0.0.1:8000/>：返回 `{"status":"alive"}` 表示服务已启动；
+- <http://127.0.0.1:8000/health/config>：显示已选 Provider、模型及缺失配置，不显示密钥。
+
+普通启动默认关闭热重载，以兼容受限目录、容器和部分 Windows 文件监视器环境；本地开发需要自动重启时，在 `backend/.env` 中设置 `DEV_RELOAD=1` 后重启后端。
+
+### 3. 启动前端
+
+保持后端终端运行，再打开终端 B：
+
+```bash
+npm --prefix frontend run dev
 ```
 
 按终端显示的地址打开页面。前端默认连接 `ws://localhost:8000/ws/chat`；选择角色并保存设置后即可发起对话。
+
+若后端开启了 `WS_AUTH_TOKEN`，复制 `frontend/.env.example` 为 `frontend/.env.local`，并填写与后端相同的令牌后重启前端。
+
+### 可选：火山图像 SDK
+
+只有当 `backend/.env` 中指定 `IMAGE_PROVIDER=volcengine` 时，才需要额外安装厂商 SDK：
+
+```bash
+backend/.venv/bin/python -m pip install -r backend/requirements-volcengine.txt
+```
+
+Windows 请将 `backend/.venv/bin/python` 替换为 `backend\.venv\Scripts\python.exe`。使用默认智谱图像服务或关闭实时绘图时不需要此步骤。
 
 ## 测试与质量检查
 
@@ -149,7 +186,9 @@ LLMGal/
 │   │   └── test_service_and_state_cases.py  # 文本、语音、图片和资源状态测试（20 条）
 │   └── requirements-test.txt                # 独立测试依赖
 ├── scripts/
-│   └── run_module1_tests.sh                 # 一键运行全部 34 条用例
+│   ├── run_module1_tests.py                 # 跨平台测试启动器
+│   ├── run_module1_tests.sh                 # macOS/Linux 入口
+│   └── run_module1_tests.bat                # Windows 入口
 └── docs/module1/
     └── LLMGal_backend_34_test_cases.md       # 34 条测试用例清单
 ```
@@ -162,17 +201,44 @@ LLMGal/
 
 测试函数名直接包含清单编号。例如，清单中的 `TC-WS-01` 对应 `test_tc_ws_01_valid_static_request_full_flow`，可以据此从用例清单定位到具体代码。
 
-在仓库根目录执行以下命令，即可自动创建 Python 3.11 虚拟环境、安装精简测试依赖并运行全部 34 个后端单元测试：
+#### 一键启动（模块一）
 
-```bash
-./scripts/run_module1_tests.sh
+前置条件：安装 Python 3.9+；首次运行需能够访问 Python 包源安装依赖。**不需要启动后端、不需要 API Key，也不会调用真实 LLM/TTS 服务。**
+
+在 `LLMGal` 仓库根目录按平台执行一条命令：
+
+| 平台 | 启动命令 |
+| --- | --- |
+| macOS / Linux | `./scripts/run_module1_tests.sh` |
+| Windows PowerShell / CMD | `scripts\run_module1_tests.bat` |
+| 所有平台（推荐的通用入口） | `python scripts/run_module1_tests.py` |
+
+启动器会自动创建或复用 `.venv-module1`、安装/更新测试依赖、执行 `backend/tests/` 的 34 条用例，并生成日志与 JUnit 结果。正常基线为：
+
+```text
+32 passed, 2 xfailed
 ```
 
-如需显示每条用例名称：
+常用命令：
 
 ```bash
-./scripts/run_module1_tests.sh -v
+# 显示每条用例名称
+python scripts/run_module1_tests.py -v
+
+# 指定 Python 解释器
+python scripts/run_module1_tests.py --python python3.12
+
+# Python 版本切换、环境损坏或依赖异常时，强制重建测试虚拟环境
+python scripts/run_module1_tests.py --recreate-venv
 ```
+
+也可在 macOS/Linux 上通过环境变量指定解释器：
+
+```bash
+LLMGAL_TEST_PYTHON=/path/to/python3.12 ./scripts/run_module1_tests.sh
+```
+
+如果 `.venv-module1` 的 Python 主次版本与当前启动器不同，启动器会自动重建它，避免复用错误解释器。
 
 34 个测试函数与 [`docs/module1/LLMGal_backend_34_test_cases.md`](docs/module1/LLMGal_backend_34_test_cases.md) 中的用例编号一一对应，覆盖配置映射、情绪解析、资源索引边界、静态与实时图像分支、文本提示词、语音保存、HTTP 请求结构、健康检查及 WebSocket 错误协议。文本模型、语音和图像相关依赖均使用固定 Mock/Stub；测试夹具会阻断遗漏的真实 HTTP 与 WebSocket 调用，因此不需要 API Key，不会调用真实大模型或产生第三方服务费用。
 
@@ -184,12 +250,6 @@ LLMGal/
 
 - `artifacts/test-results/pytest-output.txt`：终端执行日志与覆盖率摘要
 - `artifacts/test-results/module1-junit.xml`：可供持续集成或报告工具读取的 JUnit 结果
-
-如果 Python 3.11 的命令名称不同，可以显式指定解释器：
-
-```bash
-LLMGAL_TEST_PYTHON=/path/to/python3.11 ./scripts/run_module1_tests.sh
-```
 
 ### 前端测试
 

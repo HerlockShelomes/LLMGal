@@ -1,0 +1,3 @@
+# 仅当 backend/.env 中 IMAGE_PROVIDER=volcengine 时需要。
+-r requirements.txt
+volcengine==1.0.192
