@@ -503,4 +503,12 @@ if __name__ == "__main__":
     import uvicorn
     # 默认只监听本机（缺陷 B02）：原先绑定 0.0.0.0 且无鉴权，等于把 API 额度暴露在网络上。
     # 需要局域网/外网访问时，在 .env 里显式设置 HOST，并务必同时配置 WS_AUTH_TOKEN。
-    uvicorn.run(app, host=config.HOST, port=config.PORT, reload=True)
+    # 开启 reload 时 Uvicorn 必须接收可重新导入的应用字符串；直接传 app
+    # 对象会在新版 Uvicorn 中拒绝启动。默认关闭 watcher，避免受限目录、容器
+    # 或部分 Windows 环境中因文件监视器而启动失败；开发时可设 DEV_RELOAD=1。
+    uvicorn.run(
+        "Connect:app",
+        host=config.HOST,
+        port=config.PORT,
+        reload=config.DEV_RELOAD,
+    )
