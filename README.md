@@ -58,51 +58,118 @@ LLMGal/
 
 ## 环境要求
 
-- Python 3.11
-- Node.js 18 或更高版本
+- Python 3.11–3.14（推荐 3.11 或 3.12；不支持 Python 3.10 及更早版本）
+- Node.js 18 或更高版本（建议使用 Node.js LTS）
 - npm 9 或更高版本
 - 可访问所配置文本、语音和图像服务的网络环境
 
+项目不需要 MySQL、Redis 或其他数据库即可体验聊天功能。运行时依赖已与历史开发依赖拆分；首次部署无需安装数据库客户端或 C/C++ 编译工具。
+
 ## 配置说明
 
-完整多模态流程依赖三类第三方服务：OpenAI 兼容的文本模型接口、火山引擎图像服务和语音合成服务。当前原型的服务配置仍分散在 `backend/Text.py`、`backend/Image.py` 和 `backend/Voice.py` 中。
+完整多模态流程依赖文本模型、语音合成与可选的实时图像服务。服务配置统一由 `backend/config.py` 从 `backend/.env` 或系统环境变量读取；环境变量优先于 `.env`，便于本地开发和 CI 部署。
 
 使用前请完成以下工作：
 
-1. 为三类服务准备仅用于开发或测试的凭据。
-2. 将配置改为从环境变量或本地 `.env` 文件读取。
-3. 确保 `.env` 已被 Git 忽略，禁止提交真实密钥。
-4. 对曾经提交到仓库的凭据立即作废并重新生成。
+1. 复制 `backend/.env.example` 为 `backend/.env`，填写仅用于开发或测试的凭据；初始化脚本会在 `.env` 缺失时自动完成复制。
+2. 至少配置一个文本模型密钥；若要听到语音，再配置 TTS 密钥。普通聊天默认使用静态情绪图，未配置图像服务也可体验文本与语音。
+3. `.env` 与 `frontend/.env.local` 已被 Git 忽略，禁止提交真实密钥。
+4. 若启用 `WS_AUTH_TOKEN`，还须将相同值写入 `frontend/.env.local` 的 `VITE_WS_TOKEN`。
 
 前端设置面板中的 API Key 仅供前端直连接口相关功能使用，不能替代后端所需配置。
 
 ## 快速开始
 
-### 1. 启动后端
+### 推荐：一键初始化
 
-在仓库根目录执行：
+克隆仓库后，在 **LLMGal 仓库根目录**执行：
 
 ```bash
-cd backend
-python3.11 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-python -m pip install -r requirements.txt
-python -m uvicorn Connect:app --reload --host 127.0.0.1 --port 8000
+python scripts/setup_local.py
 ```
 
-后端必须从 `backend` 目录启动，因为当前代码使用了相对于该目录的资源路径。浏览器访问 <http://127.0.0.1:8000/>，返回 `{"status":"alive"}` 表示服务已启动。
+该命令会：
 
-### 2. 启动前端
+1. 校验 Python 版本，并创建或复用 `backend/.venv`；
+2. 安装最小后端运行时依赖，不安装 MySQL/Redis 等无关历史依赖；
+3. 在缺失时从 `.env.example` 创建 `backend/.env`，且绝不覆盖已有本地配置；
+4. 通过 `npm ci` 安装前端锁定依赖。
 
-打开另一个终端：
+常用选项：
 
 ```bash
-cd frontend
-npm ci
-npm run dev
+# 当前 python 不是目标版本时，明确指定解释器
+python scripts/setup_local.py --python python3.11
+
+# 仅部署后端或前端
+python scripts/setup_local.py --backend-only
+python scripts/setup_local.py --frontend-only
+
+# 虚拟环境损坏或切换 Python 主次版本后重建
+python scripts/setup_local.py --recreate-venv
+```
+
+Windows PowerShell / CMD 同样使用：
+
+```powershell
+py scripts\setup_local.py
+```
+
+若 Windows 中 `py` 默认指向不支持的 Python，请指定受支持版本来运行启动器：
+
+```powershell
+py -3.11 scripts\setup_local.py
+```
+
+### 1. 配置本地密钥
+
+打开 `backend/.env`，按注释填写密钥。最小可用组合通常是：
+
+```env
+TEXT_PROVIDER=zhipu
+ZHIPU_API_KEY=你的文本模型开发密钥
+TTS_PROVIDER=qwen
+DASHSCOPE_API_KEY=你的语音服务开发密钥
+```
+
+如果只希望确认服务能启动、不发起聊天请求，也可以暂不填写密钥。服务启动后会在控制台及 `/health/config` 中报告缺失项，但不会打印密钥内容。
+
+### 2. 启动后端
+
+在仓库根目录打开终端 A：
+
+```bash
+python scripts/start_backend.py
+```
+
+启动脚本会自动使用 `backend/.venv`，并从正确的 `backend` 工作目录运行，避免相对资源路径错误。浏览器访问：
+
+- <http://127.0.0.1:8000/>：返回 `{"status":"alive"}` 表示服务已启动；
+- <http://127.0.0.1:8000/health/config>：显示已选 Provider、模型及缺失配置，不显示密钥。
+
+普通启动默认关闭热重载，以兼容受限目录、容器和部分 Windows 文件监视器环境；本地开发需要自动重启时，在 `backend/.env` 中设置 `DEV_RELOAD=1` 后重启后端。
+
+### 3. 启动前端
+
+保持后端终端运行，再打开终端 B：
+
+```bash
+npm --prefix frontend run dev
 ```
 
 按终端显示的地址打开页面。前端默认连接 `ws://localhost:8000/ws/chat`；选择角色并保存设置后即可发起对话。
+
+若后端开启了 `WS_AUTH_TOKEN`，复制 `frontend/.env.example` 为 `frontend/.env.local`，并填写与后端相同的令牌后重启前端。
+
+### 可选：火山图像 SDK
+
+只有当 `backend/.env` 中指定 `IMAGE_PROVIDER=volcengine` 时，才需要额外安装厂商 SDK：
+
+```bash
+backend/.venv/bin/python -m pip install -r backend/requirements-volcengine.txt
+```
+
+Windows 请将 `backend/.venv/bin/python` 替换为 `backend\.venv\Scripts\python.exe`。使用默认智谱图像服务或关闭实时绘图时不需要此步骤。
 
 ## 测试与质量检查
 

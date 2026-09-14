@@ -327,6 +327,9 @@ WS_AUTH_TOKEN = _get("WS_AUTH_TOKEN", "")
 CORS_ALLOW_ORIGINS = _get("CORS_ALLOW_ORIGINS", "*")
 HOST = _get("HOST", "127.0.0.1")
 PORT = _get_int("PORT", 8000)
+# 普通本地部署默认关闭热重载，避免文件监视器在 Windows、容器或受限目录中导致启动失败。
+# 开发时可在 .env 中显式设为 1 / true。
+DEV_RELOAD = _get_bool("DEV_RELOAD", False)
 
 
 def missing_credentials() -> list[str]:
