@@ -1,33 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 仓库历史中包含已跟踪的 .pyc 文件；禁止测试运行改写这些二进制文件。
-export PYTHONDONTWRITEBYTECODE=1
+# macOS/Linux compatibility wrapper. The Python launcher owns all platform-
+# specific virtual-environment handling, including stale-interpreter recovery.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_DIR="${PROJECT_ROOT}/.venv-module1"
-PYTHON_BIN="${LLMGAL_TEST_PYTHON:-python3.11}"
-
-if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-  if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
-    echo "未找到 ${PYTHON_BIN}。请安装 Python 3.11，或通过 LLMGAL_TEST_PYTHON 指定解释器。" >&2
-    exit 1
-  fi
-  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
-  "${VENV_DIR}/bin/python" -m pip install --upgrade pip
-  "${VENV_DIR}/bin/python" -m pip install -r "${PROJECT_ROOT}/backend/requirements-test.txt"
+if [[ -n "${LLMGAL_TEST_PYTHON:-}" ]]; then
+  exec "${LLMGAL_TEST_PYTHON}" "${SCRIPT_DIR}/run_module1_tests.py" "$@"
 fi
 
-mkdir -p "${PROJECT_ROOT}/artifacts/test-results"
-cd "${PROJECT_ROOT}/backend"
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 "${SCRIPT_DIR}/run_module1_tests.py" "$@"
+fi
 
-"${VENV_DIR}/bin/python" -m pytest \
-  tests \
-  --junitxml="${PROJECT_ROOT}/artifacts/test-results/module1-junit.xml" \
-  --cov=Connect \
-  --cov=Integration \
-  --cov=Text \
-  --cov=Voice \
-  --cov=Image \
-  --cov-report=term-missing \
-  "$@" | tee "${PROJECT_ROOT}/artifacts/test-results/pytest-output.txt"
+exec python "${SCRIPT_DIR}/run_module1_tests.py" "$@"
