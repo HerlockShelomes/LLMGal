@@ -1,17 +1,27 @@
 <script setup lang="ts">
-import {reactive, computed, ref, watchEffect} from 'vue'
+import {reactive, computed, ref, watch, watchEffect, onBeforeUnmount} from 'vue'
 import {
   useSettingsStore,
   useModelOptions,
   type ModelOption,
   useRoleOptions,
-  getImageUrl,
+  useRoleImage,
   getDescriptionFile,
   getTestAudioUrls,
   ROLE_VOICE_LABELS,
+  VOICE_CATEGORY_GROUPS,
+  VOICE_OPTIONS,
+  API_BASE,
+  staticUrl,
+  APP_MODE_LABELS,
+  type AppMode,
+  type CustomRoleDetail,
 } from '../stores/settings.ts'
 // 全局单一发声通道：试听音与 ChatView 的对话语音互斥
 import {claimPlayback} from '../utils/audioBus.ts'
+import {stopWatchingAll, watchRoleCreation} from '../utils/roleCreation.ts'
+// 运行时模式（Mock / 正式版）：真相源在后端，这里只负责显示与触发切换
+import {switchAppMode, syncAppModeFromBackend} from '../utils/appMode.ts'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Edit, Delete, Plus, InfoFilled } from '@element-plus/icons-vue'
 import { ElTooltip } from 'element-plus'
@@ -114,6 +124,41 @@ const checkModelValueExists = (value: string, excludeValue?: string) => {
 // 已删除 checkRoleOverlap：该函数从未被任何地方调用（无自定义角色新增入口会用到它），
 // 在 vue-tsc 的 noUnusedLocals 下直接让 npm run build 失败。
 // 后续若要支持"新增自定义角色"，在这里照 checkModelOverlap 的写法接上即可。
+
+// ----------------------------------------------------------------------------
+// 运行时模式（Mock / 正式版）
+//
+// 判定发生在后端每一轮请求上，所以切换后无需刷新页面、也不影响正在播放的音频；
+// 前端只做两件事：显示当前模式、把用户的选择发给后端。
+// ----------------------------------------------------------------------------
+const modeSwitching = ref(false)
+const isMockMode = computed(() => settingsStore.appMode === 'mock')
+const appModeLabel = computed(() => APP_MODE_LABELS[settingsStore.appMode])
+
+const toggleAppMode = async () => {
+  if (modeSwitching.value) return
+  const target: AppMode = isMockMode.value ? 'prod' : 'mock'
+  modeSwitching.value = true
+  try {
+    const state = await switchAppMode(target)
+    // 失败时 switchAppMode 已经提示过，这里保持界面原状即可
+    if (!state) return
+    settingsStore.setAppMode(state.mode)
+    if (state.mode === 'mock') {
+      ElMessage.success('已切换到 Mock 版：AI 不再接入回复，音频与图像固定为测试内容')
+    } else {
+      ElMessage.success('已切换回正式版：AI 已接入，所有基础功能可正常使用')
+    }
+  } finally {
+    modeSwitching.value = false
+  }
+}
+
+// 打开设置面板时与后端对一次账：可能被另一个标签页切过，或手工改过开关文件。
+// 不这样做的话，界面会拿一份过期的本地镜像骗用户。
+watch(visible, (open) => {
+  if (open) syncAppModeFromBackend()
+})
 
 // 处理深色模式切换
 const handleDarkModeChange = () => {
@@ -326,21 +371,35 @@ const showT2ISettings = computed(() => {
 // }
 
 
-const showAvatar = ref<boolean>(true)
-const handleImageError = () => {
-  showAvatar.value = false
-  ElMessage.warning('角色图片缺失')
-}
-
 const content = ref<string>('')
 const errorMessage = ref<string>('')
 
-// 角色立绘：getImageUrl 在资源缺失时返回空串，据此判断是否显示占位符
-const roleImageUrl = computed(() => getImageUrl(settings.RoleConfig.roleName, 'neutral'))
+// 角色立绘：候选逐级回退（glob → dev 直连磁盘 → 后端 /static）。
+// 每个候选加载失败就试下一个，全部失败 url 为空串 → 显示「显示失败」占位符。
+const roleImage = useRoleImage(
+  () => settings.RoleConfig.roleName,
+  () => 'neutral',
+)
+const roleImageUrl = roleImage.url
 const roleDocUrl = computed(() => getDescriptionFile(settings.RoleConfig.roleName))
+
+const handleImageError = () => {
+  roleImage.onError()
+  // 所有候选都试完仍失败，才提示缺失
+  if (!roleImage.url.value) {
+    ElMessage.warning('角色图片缺失')
+  }
+}
 
 watchEffect(async () => {
   const currentRole = settings.RoleConfig.roleName
+  // 自定义角色：详情已在前端保存，直接展示其性格设定，无需再请求磁盘 txt
+  const detail = settingsStore.customRoleDetails[currentRole]
+  if (detail?.personality) {
+    content.value = detail.personality
+    errorMessage.value = ''
+    return
+  }
   try {
     const docContent = await fetch(roleDocUrl.value)
             .then(read => read.ok ? read.text():Promise.reject('文档不存在'))
@@ -358,9 +417,15 @@ watchEffect(async () => {
 const audio = ref<HTMLAudioElement | null>(null)
 
 // 仅用于展示：真正发声用的是 backend/config.py 的 ROLE_VOICES
-const currentVoiceLabel = computed(
-  () => ROLE_VOICE_LABELS[settings.RoleConfig.roleName] ?? '未配置（沿用默认音色）'
-)
+const currentVoiceLabel = computed(() => {
+  const name = settings.RoleConfig.roleName
+  const detail = settingsStore.customRoleDetails[name]
+  if (detail?.voiceId) {
+    const v = VOICE_OPTIONS.find(x => x.id === detail.voiceId)
+    return v ? `${v.name}（${v.desc}）` : detail.voiceId
+  }
+  return ROLE_VOICE_LABELS[name] ?? '未配置（沿用默认音色）'
+})
 
 // 试听播放令牌：换角色/重复点击时作废上一次的在途回调
 let testPlayToken = 0
@@ -434,6 +499,327 @@ const clickAudio = () => {
   play()
 };
 
+// ----------------------------------------------------------------------------
+// 创建新角色：弹窗 + 表单 + 保存
+// ----------------------------------------------------------------------------
+
+const createRoleVisible = ref(false)
+
+// 新角色表单：角色名称、性格特征（字符串）、音色（下拉 id）、形象描述（可空）
+const newRole = reactive({
+  name: '',
+  personality: '',
+  voiceId: '',
+  imageDescription: '',
+})
+
+// 打开弹窗时重置表单
+const openCreateRole = () => {
+  newRole.name = ''
+  newRole.personality = ''
+  newRole.voiceId = ''
+  newRole.imageDescription = ''
+  generatedImages.value = []
+  selectedImage.value = null
+  generatingImage.value = false
+  createRoleVisible.value = true
+}
+
+// --------------------------------------------------------------------------
+// 候选形象：生成到后端 pictures/temp，用户点图片在已生成的形象间挑选
+// --------------------------------------------------------------------------
+interface GeneratedImage {
+  index: number
+  filename: string
+  url: string        // 后端 /static 路径
+  description: string // 选中这张时随角色一起保存的形象描述
+}
+
+const generatedImages = ref<GeneratedImage[]>([])
+const selectedImage = ref<GeneratedImage | null>(null)
+const generatingImage = ref(false)
+
+// 展示用地址：经后端静态服务，带时间戳破浏览器缓存
+const displayedImageUrl = computed(() =>
+  selectedImage.value ? staticUrl(selectedImage.value.url) : ''
+)
+
+const selectGeneratedImage = (item: GeneratedImage) => {
+  selectedImage.value = item
+}
+
+// 生成形象：用户填了描述就扩写，没填就让模型按 角色名+性格+音色 想象
+const generateImage = async () => {
+  const name = newRole.name.trim()
+  if (!name) {
+    ElMessage.warning('请先填写角色名称')
+    return
+  }
+  generatingImage.value = true
+  try {
+    const resp = await fetch(`${API_BASE}/api/roles/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        roleName: name,
+        personality: newRole.personality.trim(),
+        description: newRole.imageDescription.trim(),
+        voiceId: newRole.voiceId,
+      }),
+    })
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}))
+      throw new Error(detail.detail || `HTTP ${resp.status}`)
+    }
+    const data = await resp.json()
+    const item: GeneratedImage = {
+      index: data.index,
+      filename: data.filename,
+      url: data.url,
+      description: data.description || '',
+    }
+    generatedImages.value.push(item)
+    selectedImage.value = item
+    ElMessage.success('形象已生成，可继续生成其它方案')
+  } catch (err) {
+    console.warn('[生成形象] 失败：', err)
+    ElMessage.warning(`生成形象失败：${err instanceof Error ? err.message : err}`)
+  } finally {
+    generatingImage.value = false
+  }
+}
+
+// 创建进度的轮询器是全局单例（见 utils/roleCreation.ts）：
+// 页面刷新后 localStorage 里残留的「创建中」角色也要能被继续盯住，
+// 不能把轮询器锁死在弹窗组件里。这里只负责卸载时清掉自己那批定时器。
+// 最近一次发起创建的角色名：轮询结束时的提示语要用（回调里拿不到角色名）
+const lastCreatedRole = ref('')
+
+onBeforeUnmount(() => {
+  stopWatchingAll()
+})
+
+const handleCreationDone = (ok: boolean, error?: string) => {
+  if (ok) {
+    ElMessage.success(`角色「${lastCreatedRole.value}」创建完成，可以开始对话了`)
+  } else {
+    ElMessage.error(`角色「${lastCreatedRole.value}」创建失败：${error || '未知错误'}`)
+  }
+}
+
+// 保存新角色：校验 -> 前端立即可用（角色列表 + 详情）-> 通知后端异步定稿
+const saveNewRole = async () => {
+  const name = newRole.name.trim()
+  const personality = newRole.personality.trim()
+
+  if (!name) {
+    ElMessage.warning('请填写角色名称')
+    return
+  }
+  if (!personality) {
+    ElMessage.warning('请填写角色性格特征')
+    return
+  }
+  // 重名检查：默认角色 + 已创建的自定义角色（大小写不敏感）
+  const dup = roleOptions.value.some(
+    r => r.value.toLowerCase() === name.toLowerCase()
+  )
+  if (dup) {
+    ElMessage.warning(`角色「${name}」已存在，请换一个名称`)
+    return
+  }
+  // 生成过形象就必须挑一张，否则后端不知道该保留哪张、该删哪些
+  if (generatedImages.value.length > 0 && !selectedImage.value) {
+    ElMessage.warning('请在已生成的形象中选择一张')
+    return
+  }
+
+  // 1) 立即在前端可用：加入角色选择列表 + 保存详情
+  settingsStore.addNewRole({ label: name, value: name, type: '虚拟角色' })
+  const detail: CustomRoleDetail = {
+    personality,
+    voiceId: newRole.voiceId,
+    imageDescription: selectedImage.value?.description || newRole.imageDescription.trim(),
+  }
+  settingsStore.setCustomRoleDetail(name, detail)
+
+  // 2) 标记「创建中」：左下角出现滚动加载条，期间调用会被拦截
+  settingsStore.addCreatingRole(name)
+
+  // 3) 通知后端异步定稿（落盘 + 7 张情绪图 + 语音），前端不等它
+  try {
+    const resp = await fetch(`${API_BASE}/api/roles/create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        roleName: name,
+        personality,
+        description: detail.imageDescription,
+        voiceId: newRole.voiceId,
+        selectedImage: selectedImage.value?.filename || '',
+      }),
+    })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  } catch (err) {
+    console.warn('[创建角色] 后端定稿接口调用失败：', err)
+    settingsStore.removeCreatingRole(name)
+    ElMessage.error('角色创建失败，请确认后端已启动')
+    return
+  }
+
+  ElMessage.success(`角色「${name}」创建中，完成后即可使用`)
+  createRoleVisible.value = false
+  lastCreatedRole.value = name
+  watchRoleCreation(name, handleCreationDone)
+}
+
+// 只有「创建新角色」产生的自定义角色可删；内置角色后端也会拒绝（403），
+// 前端直接隐藏入口，免得点了才知道不能删。
+const canDeleteRole = computed(() =>
+  settingsStore.customRoles.some(r => r.value === settings.RoleConfig.roleName)
+)
+const deletingRole = ref(false)
+
+// 删除角色：先二次确认，再由后端清落盘（角色信息 / 图片 / 语音 / Records / 音色登记），
+// **成功之后**才清前端状态。顺序不能反 —— 反过来一旦后端失败，前端已经查不到这个角色，
+// 用户既看不见它、也没法重试。
+const deleteCurrentRole = async () => {
+  const name = settings.RoleConfig.roleName
+  if (!canDeleteRole.value || !name) return
+  try {
+    await ElMessageBox.confirm(
+      `将删除角色「${name}」的全部记录：角色设定、形象与情绪图片、语音、对话记录（Records）与后端音色登记。此操作不可撤销。`,
+      '删除角色',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  deletingRole.value = true
+  try {
+    const resp = await fetch(`${API_BASE}/api/roles/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roleName: name }),
+    })
+    const data = await resp.json().catch(() => ({}))
+    if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`)
+    settingsStore.purgeRole(name)
+    const count = Array.isArray(data.removed) ? data.removed.length : 0
+    ElMessage.success(
+      count
+        ? `角色「${name}」已删除（清理 ${count} 项落盘记录）`
+        : `角色「${name}」已移除（后端没有找到它的落盘记录）`
+    )
+  } catch (err) {
+    console.warn('[删除角色] 失败：', err)
+    ElMessage.error(`删除角色失败：${err instanceof Error ? err.message : err}`)
+  } finally {
+    deletingRole.value = false
+  }
+}
+
+// 试听选中音色：拉取后端为该音色预生成的样本（本地还没有就现场合成一份）。
+const previewAudioEl = ref<HTMLAudioElement | null>(null)
+let previewToken = 0
+// 上一次试听创建的 blob URL，换音色时释放，避免一直占着内存
+let previewObjectUrl: string | null = null
+
+const releasePreviewUrl = () => {
+  if (previewObjectUrl) {
+    URL.revokeObjectURL(previewObjectUrl)
+    previewObjectUrl = null
+  }
+}
+
+const previewVoice = async () => {
+  const voiceId = newRole.voiceId
+  if (!voiceId) {
+    ElMessage.warning('请先选择音色')
+    return
+  }
+  const el = previewAudioEl.value
+  if (!el) {
+    // 音频元素在弹窗里，理论上打开弹窗后一定存在；真拿不到就别静默失联
+    console.warn('[试听] 未找到音频元素（弹窗未渲染？）')
+    ElMessage.warning('试听组件未就绪，请重新打开弹窗')
+    return
+  }
+
+  // 抢占全局发声通道，避免与对话语音/其它试听叠在一起
+  claimPlayback(el)
+  const token = ++previewToken
+
+  // 播放就绪后起播。readyState>=2 才 play()：在 0 时发起会被浏览器挂住很久，
+  // 落定时早已是过期请求（项目里踩过这个坑，见 MEMORY 的音频五条铁律）。
+  // onTimeout 由调用方决定「等不到数据」时怎么办。
+  const playWhenReady = (sourceLabel: string, onTimeout: () => void) => {
+    const deadline = Date.now() + 5000
+    const waitForData = () => {
+      if (token !== previewToken) return
+      if (el.readyState >= 2 /* HAVE_CURRENT_DATA */) {
+        el.play()?.catch((error: unknown) => {
+          console.warn(`[试听] play() 被拒绝（${sourceLabel}）:`, error)
+          ElMessage.warning('浏览器拦截了自动播放，点击页面任意位置后再试')
+        })
+        return
+      }
+      if (Date.now() >= deadline) {
+        console.warn(
+          `[试听] 等待音频数据超时（${sourceLabel}）readyState=${el.readyState} ` +
+          `networkState=${el.networkState} src=${el.currentSrc || el.src}`
+        )
+        onTimeout()
+        return
+      }
+      window.setTimeout(waitForData, 150)
+    }
+    window.setTimeout(waitForData, 150)
+  }
+
+  // blob 链路走不通时的兜底：直连后端地址。http(s) URL 可以安全带 _t 破缓存。
+  const fallbackToDirect = () => {
+    if (token !== previewToken) return
+    console.warn('[试听] blob 地址加载不出数据，回退到直连地址重试')
+    releasePreviewUrl()
+    el.src = `${API_BASE}/api/voices/preview?voice=${encodeURIComponent(voiceId)}&_t=${Date.now()}`
+    el.load()
+    playWhenReady('direct', () => {
+      console.warn('[试听] 直连地址同样超时')
+      ElMessage.warning('试听音频加载超时，请确认后端已启动')
+    })
+  }
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/voices/preview?voice=${encodeURIComponent(voiceId)}`)
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const blob = await resp.blob()
+    if (!blob.size) throw new Error('返回的音频为空')
+
+    if (token !== previewToken) return
+
+    // 关键：blob URL 本身就是「每次 fetch 都不同」的，**不能**再拼 ?_t= 时间戳。
+    // 往 blob: URL 后面加查询串会改变 URL 串，浏览器按整串查不到 blob 条目，
+    // 元素永远加载不出来（readyState 停在 0、无 error、只有静默超时）。
+    // 破缓存这套只对 http(s) URL 有意义。
+    releasePreviewUrl()
+    previewObjectUrl = URL.createObjectURL(blob)
+    el.src = previewObjectUrl
+    el.load()
+    playWhenReady('blob', fallbackToDirect)
+  } catch (err) {
+    // 走到这里说明「样本没拿到」而不是「拿到了放不出来」，直连也一样没资源，
+    // 所以不做兜底，直接把原因说清楚。
+    console.warn('[试听] 音色样本获取失败：', err)
+    ElMessage.warning('试听失败：未能从后端取到音色样本，请确认后端已启动')
+  }
+}
+
+// 音频元素被替换/卸载时释放 blob URL
+onBeforeUnmount(() => {
+  releasePreviewUrl()
+})
+
 
 // const formatTime = (seconds: number) => {
 //   const mins = Math.floor(seconds/60)
@@ -483,6 +869,28 @@ const clickAudio = () => {
   <!-- 设置抽屉组件，用于展示和编辑应用设置 -->
   <el-drawer style="background-color: var(--bg-color);" v-model="visible" title="设置" direction="rtl" size="380px">
     <div class="settings-container">
+      <!-- 运行时模式开关：置于设置页最顶部，按钮沿用「创建新角色」的样式 -->
+      <div class="app-mode-bar" :class="{ 'is-mock': isMockMode }">
+        <div class="app-mode-status">
+          <span class="app-mode-dot" />
+          当前：{{ appModeLabel }}
+        </div>
+        <div class="app-mode-tip">
+          {{ isMockMode
+              ? 'AI 已旁路：回复固定为系统状态回执，音频用本地测试样本，图像固定为 neutral。用于验证前端展示、后端处理与前后端连接。'
+              : 'AI 已接入：所有基础功能可用。切换后立即生效，无需刷新页面。' }}
+        </div>
+        <button
+            type="button"
+            class="create-role-btn app-mode-btn"
+            :class="{ 'is-mock': isMockMode }"
+            :disabled="modeSwitching"
+            @click="toggleAppMode"
+        >
+          {{ modeSwitching ? '切换中…' : (isMockMode ? '切换回正式版' : '切换到 Mock 版') }}
+        </button>
+      </div>
+
       <!-- 使用element-plus的表单组件来展示和编辑设置 -->
       <el-form :model="settings" label-width="120px">
         <!-- 深色模式切换 -->
@@ -639,14 +1047,22 @@ const clickAudio = () => {
                   </el-tag>
                   <span>{{ role.label }}</span>
                 </div>
-                <div v-if="settingsStore.customRoles.includes(role)" class="role-actions">
-                  <!---此处需要完善增删角色逻辑--->
-                </div>
+                <!---删除入口不放在下拉项里：点选项会同时触发选中，容易误删正在切换的角色。
+                    自定义角色的删除按钮统一放在角色选择框下方（.delete-role-btn）。--->
               </div>
             </el-option>
           </el-select>
           </span>
           </div>
+          <button
+              v-if="canDeleteRole"
+              type="button"
+              class="delete-role-btn"
+              :disabled="deletingRole"
+              @click="deleteCurrentRole"
+          >
+            {{ deletingRole ? '正在删除…' : '删除该角色' }}
+          </button>
         </el-form-item>
 
 
@@ -777,6 +1193,13 @@ const clickAudio = () => {
       <div class="settings-footer">
         <el-button type="primary" @click="handleSave">保存设置</el-button>
       </div>
+
+      <!-- 创建新角色：位于设置最底部，居中，绿底白字 -->
+      <div class="create-role-bar">
+        <button type="button" class="create-role-btn" @click="openCreateRole">
+          + 创建新角色
+        </button>
+      </div>
     </div>
 
     <!-- 添加/编辑模型对话框 -->
@@ -805,6 +1228,129 @@ const clickAudio = () => {
         <el-button @click="modelDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="handleSaveModel">确定</el-button>
       </template>
+    </el-dialog>
+
+    <!-- 创建新角色弹窗 -->
+    <el-dialog
+      title="创建新角色"
+      v-model="createRoleVisible"
+      width="560px"
+      align-center
+      :close-on-click-modal="false"
+    >
+      <div class="create-role-form">
+        <!-- 1. 角色名称（必填，最上方） -->
+        <div class="cr-field">
+          <label class="cr-label">角色名称 <span class="cr-required">*</span></label>
+          <el-input
+            v-model="newRole.name"
+            placeholder="例如：星野"
+            maxlength="20"
+            show-word-limit
+          />
+        </div>
+
+        <!-- 2. 角色性格特征（必填，纵向排列在名称下方） -->
+        <div class="cr-field">
+          <label class="cr-label">角色性格特征 <span class="cr-required">*</span></label>
+          <el-input
+            v-model="newRole.personality"
+            type="textarea"
+            :rows="4"
+            placeholder="描述角色的性格、语气、口头禅等，将作为该角色的设定文档保存"
+          />
+        </div>
+
+        <!-- 3. 音色设置：按类别分组下拉 + 试听 -->
+        <div class="cr-field">
+          <label class="cr-label">音色设置</label>
+          <div class="cr-voice-row">
+            <el-select
+              v-model="newRole.voiceId"
+              placeholder="请选择音色"
+              class="cr-voice-select"
+            >
+              <el-option-group
+                v-for="group in VOICE_CATEGORY_GROUPS"
+                :key="group.category"
+                :label="group.category"
+              >
+                <el-option
+                  v-for="v in group.voices"
+                  :key="v.id"
+                  :label="`${v.name}（${v.gender} · ${v.desc}）`"
+                  :value="v.id"
+                />
+              </el-option-group>
+            </el-select>
+            <el-button @click="previewVoice">试听</el-button>
+          </div>
+        </div>
+
+        <!-- 4. 形象设置：描述输入框 + 居中圆角矩形展示框 + 生成按钮（可留空） -->
+        <div class="cr-field cr-appearance">
+          <label class="cr-label">形象设置（可选）</label>
+          <el-input
+            v-model="newRole.imageDescription"
+            type="textarea"
+            :rows="3"
+            placeholder="填写对该角色形象的描述，例如：银发紫瞳的少女，身着深色制服……（可留空，由模型自行设计）"
+          />
+
+          <!-- 文本/图像模型工作期间的旋转加载条，位于图像框上方 -->
+          <div v-if="generatingImage" class="cr-generating">
+            <span class="cr-spinner" />
+            <span>正在生成形象…</span>
+          </div>
+
+          <!-- 形象框：点击弹出下拉，在已生成的形象之间检索 -->
+          <el-dropdown trigger="click" placement="bottom" @command="selectGeneratedImage">
+            <div class="cr-avatar-box">
+              <img
+                v-if="displayedImageUrl"
+                :src="displayedImageUrl"
+                alt="角色形象"
+                class="cr-avatar-img"
+              >
+              <div v-else-if="newRole.name" class="cr-avatar-placeholder">
+                {{ newRole.name.charAt(0) }}
+              </div>
+              <div v-else class="cr-avatar-empty">形象预览</div>
+            </div>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                  v-for="item in generatedImages"
+                  :key="item.filename"
+                  :command="item"
+                >
+                  <div class="cr-thumb-row">
+                    <img :src="staticUrl(item.url)" class="cr-thumb" alt="">
+                    <span>形象 {{ item.index + 1 }}</span>
+                  </div>
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+
+          <div v-if="generatedImages.length" class="cr-image-hint">
+            已生成 {{ generatedImages.length }} 张，点击图片可切换
+            （当前：第 {{ (selectedImage?.index ?? 0) + 1 }} 张）
+          </div>
+
+          <button type="button" class="create-role-btn cr-generate-btn" :disabled="generatingImage" @click="generateImage">
+            {{ generatingImage ? '生成中…' : '生成形象' }}
+          </button>
+        </div>
+      </div>
+
+      <template #footer>
+        <el-button @click="createRoleVisible = false">取消</el-button>
+        <el-button type="success" @click="saveNewRole">创建角色</el-button>
+      </template>
+
+      <!-- 试听专用音频元素，独立于设置面板的试听，避免互相打断 -->
+      <audio ref="previewAudioEl" preload="none" />
     </el-dialog>
   </el-drawer>
 </template>
@@ -992,6 +1538,271 @@ pre {
 .time-display {
   font-family: monospace;
   color: #1a1a1a;
+}
+
+// 创建新角色：设置页最底部，居中
+.create-role-bar {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  display: flex;
+  justify-content: center;
+}
+
+// 绿底白字，色差保证可读（深绿 #357a35 对白字约 5.3:1），圆角 + 柔阴影观感偏柔和
+.create-role-btn {
+  width: 80%;
+  max-width: 320px;
+  padding: 10px 0;
+  border: none;
+  border-radius: 10px;
+  background-color: #357a35;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(53, 122, 53, 0.28);
+  transition: background-color 0.25s ease, box-shadow 0.25s ease, transform 0.1s ease;
+}
+
+.create-role-btn:hover {
+  background-color: #3f8c3f;
+  box-shadow: 0 4px 12px rgba(53, 122, 53, 0.34);
+}
+
+.create-role-btn:active {
+  transform: translateY(1px);
+}
+
+// 删除角色：描边红字，刻意不与「创建新角色」的实心绿同权重 ——
+// 破坏性操作不该长得像主操作按钮。定义在 .create-role-btn 之后，
+// 同优先级下后定义者生效（width 不会被它的 80% 反向覆盖）。
+.delete-role-btn {
+  margin-top: 10px;
+  width: 80%;
+  max-width: 320px;
+  padding: 8px 0;
+  border: 1px solid #b23b3b;
+  border-radius: 10px;
+  background-color: transparent;
+  color: #b23b3b;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+.delete-role-btn:hover:not(:disabled) {
+  background-color: #b23b3b;
+  color: #ffffff;
+}
+
+.delete-role-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+// 弹窗表单
+.create-role-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.cr-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+// 形象区整体居中（图像框、提示、按钮都在中轴线上）
+.cr-appearance {
+  align-items: center;
+}
+
+// 旋转加载条：位于图像框上方
+.cr-generating {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+
+.cr-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--el-border-color);
+  border-top-color: #357a35;
+  border-radius: 50%;
+  animation: cr-spin 0.8s linear infinite;
+}
+
+@keyframes cr-spin {
+  to { transform: rotate(360deg); }
+}
+
+.cr-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+
+.cr-required {
+  color: #f56c6c;
+  margin-left: 2px;
+}
+
+.cr-voice-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cr-voice-select {
+  flex: 1;
+}
+
+// 形象展示框：圆角矩形，与聊天主页角色图展示风格一致
+.cr-avatar-box {
+  margin-top: 10px;
+  width: 180px;
+  height: 180px;
+  border-radius: 16px;
+  border: 2px dashed var(--el-border-color);
+  background: var(--el-fill-color-light);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.cr-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.cr-image-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.cr-generate-btn {
+  margin-top: 12px;
+  width: 60%;
+  max-width: 220px;
+}
+
+.cr-generate-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.cr-thumb-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cr-thumb {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.cr-avatar-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 64px;
+  font-weight: 700;
+  color: var(--el-color-primary);
+  background: linear-gradient(135deg, rgba(64, 158, 255, 0.12), rgba(64, 158, 255, 0.04));
+}
+
+.cr-avatar-empty {
+  font-size: 14px;
+  color: var(--el-text-color-secondary);
+}
+
+// ----------------------------------------------------------------------------
+// 运行时模式开关
+//
+// 必须定义在 .create-role-btn 之后：按钮复用那套绿底白字，同优先级下后定义者
+// 生效，放前面的话 width 会被 .create-role-btn 的 80% 覆盖回去。
+// ----------------------------------------------------------------------------
+.app-mode-bar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  margin-bottom: 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(53, 122, 53, 0.35);
+  background: rgba(53, 122, 53, 0.08);
+  transition: border-color 0.25s ease, background-color 0.25s ease;
+}
+
+// Mock 态换成琥珀色：一眼能看出「当前不是正常链路」
+.app-mode-bar.is-mock {
+  border-color: rgba(196, 125, 26, 0.45);
+  background: rgba(196, 125, 26, 0.12);
+}
+
+.app-mode-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+
+.app-mode-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #357a35;
+}
+
+.app-mode-bar.is-mock .app-mode-dot {
+  background: #c47d1a;
+}
+
+.app-mode-tip {
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+  color: var(--el-text-color-secondary);
+}
+
+.app-mode-btn {
+  width: 100%;
+  max-width: 320px;
+}
+
+.app-mode-btn.is-mock {
+  background-color: #9a5b12;
+  box-shadow: 0 2px 8px rgba(154, 91, 18, 0.32);
+}
+
+.app-mode-btn.is-mock:hover {
+  background-color: #b06d1f;
+  box-shadow: 0 4px 12px rgba(154, 91, 18, 0.38);
+}
+
+.app-mode-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
 }
 
 </style>

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 // 定义模型选项类型
 export interface ModelOption {
@@ -13,6 +13,16 @@ export interface RoleOption {
     label: string
     value: string
     type: '虚拟角色' | '数字分身'
+}
+
+// 运行时模式：'prod' = 正式版（AI 接入）/ 'mock' = Mock 版（AI 旁路）。
+// 唯一的真相源在后端（backend/runtime_mode.json，经 /api/system/mode 读写）：
+// 这里的值只是给界面用的镜像，切换与同步一律以后端返回值为准。
+export type AppMode = 'prod' | 'mock'
+
+export const APP_MODE_LABELS: Record<AppMode, string> = {
+    prod: '正式版（AI 已接入）',
+    mock: 'Mock 版（AI 已旁路）',
 }
 
 // 静态资源解析：new URL('/src/assets/...', import.meta.url) 以 / 开头，
@@ -44,36 +54,126 @@ const roleDocModules = import.meta.glob('/src/assets/roles/*.txt', {
     import: 'default',
 }) as Record<string, string>
 
+// 后端 REST 地址。Vite dev 跑在 5173，后端在 8000，不写全地址会请求到 dev server 自己。
+// 部署到别的机器时改前端 .env.local 的 VITE_API_BASE 即可。
+export const API_BASE: string = (import.meta.env.VITE_API_BASE as string) || 'http://127.0.0.1:8000'
+
+// 后端把生成物（候选形象、音色样本、情绪图）挂在 /static 上，直接拼即可
+export const staticUrl = (path: string): string => `${API_BASE}${path}`
+
 const ASSET_ROOT = '/src/assets/'
 
 // 资源缺失时返回空串，交由调用方判断，避免抛异常打断渲染
 const resolveAsset = (modules: Record<string, string>, path: string): string =>
     modules[path] ?? ''
 
-export const getImageUrl = (name: string, index: string) => {
-    return resolveAsset(pictureModules, `${ASSET_ROOT}pictures/${name}/${name}_${index}.jpg`)
-}
-
-export const getDescriptionFile = (name: string) => {
-    return resolveAsset(roleDocModules, `${ASSET_ROOT}roles/${name}.txt`)
-}
-
-// 去重，避免 dev 直连路径与 glob 解析结果相同时重复请求
+// 去重 + 丢弃空串，避免 dev 直连路径与 glob 解析结果相同时重复请求
 const dedupe = (urls: string[]): string[] => [...new Set(urls.filter(Boolean))]
+
+/**
+ * 静态资源的候选地址，按优先级排列；全取不到时返回空数组。
+ *
+ * 为什么不能只查 import.meta.glob：它是**构建期快照**，收不到构建之后由后端
+ * 运行时写入的文件。最典型的就是「创建新角色」刚生成的立绘与 7 张情绪图 ——
+ * 内置角色在快照里能取到，新建角色必然取不到，于是图片直接显示失败。
+ * 三级回退：
+ *   ① 构建期 glob        内置角色，带 hash 的正式 URL
+ *   ② dev 直连磁盘路径   后端就写在 frontend/src/assets 下，dev server 能直接服务
+ *   ③ 后端 /static       dev/prod 通用兜底（路径由后端从自身文件位置推导）
+ * 与 getAudioUrls 同一套思路：dev 下直连路径排在前，才能拿到刚写入的新文件。
+ */
+const assetCandidates = (
+    modules: Record<string, string>,
+    relPath: string,
+): string[] => {
+    const candidates = [resolveAsset(modules, `${ASSET_ROOT}${relPath}`)]
+    if (import.meta.env.DEV) {
+        candidates.push(`/src/assets/${relPath}`)
+    }
+    candidates.push(staticUrl(`/static/${relPath}`))
+    return dedupe(candidates)
+}
+
+// 角色立绘：index 为情绪名（neutral/happy/...）或 original。候选全空 = 资源缺失。
+export const getImageUrls = (name: string, index: string): string[] =>
+    assetCandidates(pictureModules, `pictures/${name}/${name}_${index}.jpg`)
+
+export const getImageUrl = (name: string, index: string): string =>
+    getImageUrls(name, index)[0] ?? ''
+
+// 角色设定文档（assets/roles/{角色}.txt）
+export const getDescriptionFiles = (name: string): string[] =>
+    assetCandidates(roleDocModules, `roles/${name}.txt`)
+
+export const getDescriptionFile = (name: string): string =>
+    getDescriptionFiles(name)[0] ?? ''
+
+/**
+ * 角色立绘的响应式地址 + 候选回退。
+ *
+ * 把 onError 接到 <img @error> 上：某个候选加载失败就自动试下一个，
+ * 全部试完 url 变回空串，调用方据此显示占位符（沿用原有语义）。
+ * 这样即便某个候选路径猜错（例如该情绪图确实没生成），也不会留下破图。
+ *
+ * 返回 { url, onError }。
+ */
+export function useRoleImage(name: () => string, index: () => string) {
+    const candidates = ref<string[]>([])
+    const cursor = ref(0)
+    const url = computed(() => candidates.value[cursor.value] ?? '')
+
+    // 角色或情绪一变就重新取候选列表，并从第一个重新试
+    watch(
+        () => [name(), index()] as const,
+        () => {
+            candidates.value = getImageUrls(name(), index())
+            cursor.value = 0
+        },
+        { immediate: true },
+    )
+
+    const onError = () => {
+        if (cursor.value < candidates.value.length) cursor.value += 1
+    }
+
+    return { url, onError }
+}
+
+/**
+ * Mock 版音频的目录名：voice/_mock/{角色}/，与正式版的 voice/{角色}/ 并列。
+ *
+ * 两个目录彻底分开是有意的 —— Mock 版原先往正式版槽位写，留下两个问题：
+ * ① 切回正式版后，引用同一 index 的历史消息会播到 Mock 拷进去的测试音频；
+ * ② index 相同的两条消息（一条 mock、一条正式）指向同一个文件，事后无法区分。
+ * 分开之后，用哪个目录由**这条消息自带的 mode** 决定（见 getAudioUrls 的 mode）。
+ */
+export const MOCK_VOICE_DIRNAME = '_mock'
 
 /**
  * 角色本轮对话语音的候选地址，按优先级排列。
  *
+ * mode 必须传「产出这条消息的模式」，不能传界面上的当前模式：
+ * 响应在途时切模式、或回看历史消息时，用当前模式都会指到另一个目录。
+ *
  * dev 下必须把「直连磁盘路径」放在第一位：后端每一轮都会覆盖写
- * frontend/src/assets/voice/{role}/{role}_{index}_Stream.wav，
+ * frontend/src/assets/voice/{目录}/{role}_{index}_Stream.wav，
  * 而 import.meta.glob 是**构建期快照**，收不到这一轮新写的文件，
  * 于是会回退到同名的历史 mp3 —— 用户听到的就是上一轮的旧语音（内容对不上）。
  * 直连路径拿不到时（例如该 provider 产出的是 mp3），由调用方按 error 事件回退。
  *
  * 生产构建下新增文件本就不该写进 src，只走 glob；返回空数组表示无资源可用。
  */
-export const getAudioUrls = (roleName: string, index: string): string[] => {
-  const base = `${ASSET_ROOT}voice/${roleName}/${roleName}_${index}_Stream`
+export const getAudioUrls = (
+  roleName: string,
+  index: string,
+  mode: AppMode = 'prod',
+): string[] => {
+  // 目录前缀只由模式决定，扩展名回退**只在同一个目录内**进行。
+  // Mock 模式下刻意不回退到正式版目录：那里是真实对话音频，播出来只会让人
+  // 误判成「mock 没生效」——宁可没有声音（后端已把 status 降为 partial）。
+  const dir = mode === 'mock' ? `${MOCK_VOICE_DIRNAME}/${roleName}` : roleName
+  const relBase = `voice/${dir}/${roleName}_${index}_Stream`
+  const base = `${ASSET_ROOT}${relBase}`
   const globbed = [
     resolveAsset(voiceWavModules, `${base}.wav`),
     resolveAsset(voiceMp3Modules, `${base}.mp3`),
@@ -82,16 +182,16 @@ export const getAudioUrls = (roleName: string, index: string): string[] => {
     // 直连磁盘的 wav 与 mp3 都放进来：qwen 档产 wav、火山档产 mp3，
     // 少放一个的话另一半 provider 的新文件就永远取不到（只能听历史素材）。
     return dedupe([
-      `/src/assets/voice/${roleName}/${roleName}_${index}_Stream.wav`,
-      `/src/assets/voice/${roleName}/${roleName}_${index}_Stream.mp3`,
+      `/src/assets/${relBase}.wav`,
+      `/src/assets/${relBase}.mp3`,
       ...globbed,
     ])
   }
   return dedupe(globbed)
 }
 
-export const getAudioUrl = (roleName: string, index: string) =>
-  getAudioUrls(roleName, index)[0] ?? ''
+export const getAudioUrl = (roleName: string, index: string, mode: AppMode = 'prod') =>
+  getAudioUrls(roleName, index, mode)[0] ?? ''
 
 /**
  * 设置面板试听音的候选地址。
@@ -124,6 +224,87 @@ export const ROLE_VOICE_LABELS: Record<string, string> = {
   Testificate: 'Momo（茉兔 · 撒娇搞怪）',
   Testificate_Boy: 'Ethan（晨煦 · 阳光温暖）',
   GirlProgrammer: 'Maia（四月 · 知性温柔）',
+}
+
+// 音色目录：按前端「创建新角色」弹窗的分类展示，id 直接是 Qwen3-TTS 的音色名，
+// 便于后续后端联动时原样下发。分类按用户要求做简易区分（御姐/萝莉/雌小鬼/少年音等）。
+export interface VoiceOption {
+  id: string
+  name: string
+  gender: string
+  desc: string
+  category: string
+}
+
+export const VOICE_CATEGORY_GROUPS: { category: string; voices: VoiceOption[] }[] = [
+  {
+    category: '御姐',
+    voices: [
+      { id: 'Serena', name: '苏瑶', gender: '女', desc: '温柔小姐姐', category: '御姐' },
+      { id: 'Katerina', name: '卡捷琳娜', gender: '女', desc: '御姐音色，韵律回味', category: '御姐' },
+      { id: 'Maia', name: '四月', gender: '女', desc: '知性与温柔的碰撞', category: '御姐' },
+      { id: 'Bellona', name: '燕铮莺', gender: '女', desc: '字正腔圆、热血铿锵', category: '御姐' },
+      { id: 'Elias', name: '墨讲师', gender: '女', desc: '严谨又擅长叙事', category: '御姐' },
+      { id: 'Jennifer', name: '詹妮弗', gender: '女', desc: '电影质感美语女声', category: '御姐' },
+      { id: 'Seren', name: '小婉', gender: '女', desc: '温和舒缓的助眠女声', category: '御姐' },
+    ],
+  },
+  {
+    category: '萝莉',
+    voices: [
+      { id: 'Bella', name: '萌宝', gender: '女', desc: '喝酒不打醉拳的小萝莉', category: '萝莉' },
+      { id: 'Bunny', name: '萌小姬', gender: '女', desc: '萌属性爆棚的小萝莉', category: '萝莉' },
+      { id: 'Nini', name: '邻家妹妹', gender: '女', desc: '软糯黏人的甜嗓', category: '萝莉' },
+      { id: 'Mia', name: '乖小妹', gender: '女', desc: '温顺如春水、乖巧如初雪', category: '萝莉' },
+    ],
+  },
+  {
+    category: '雌小鬼',
+    voices: [
+      { id: 'Vivian', name: '十三', gender: '女', desc: '拽拽的、可爱的小暴躁', category: '雌小鬼' },
+      { id: 'Momo', name: '茉兔', gender: '女', desc: '撒娇搞怪，逗你开心', category: '雌小鬼' },
+    ],
+  },
+  {
+    category: '少年音',
+    voices: [
+      { id: 'Ethan', name: '晨煦', gender: '男', desc: '阳光温暖、活力朝气', category: '少年音' },
+      { id: 'Moon', name: '月白', gender: '男', desc: '率性帅气', category: '少年音' },
+      { id: 'Mochi', name: '沙小弥', gender: '男', desc: '聪明伶俐的小大人', category: '少年音' },
+      { id: 'Nofish', name: '不吃鱼', gender: '男', desc: '不会翘舌音的设计师', category: '少年音' },
+      { id: 'Aiden', name: '艾登', gender: '男', desc: '精通厨艺的美语大男孩', category: '少年音' },
+      { id: 'Ryan', name: '甜茶', gender: '男', desc: '节奏拉满、戏感炸裂', category: '少年音' },
+      { id: 'Pip', name: '顽屁小孩', gender: '男', desc: '调皮捣蛋、充满童真的小男孩', category: '少年音' },
+    ],
+  },
+  {
+    category: '成熟男声',
+    voices: [
+      { id: 'Neil', name: '阿闻', gender: '男', desc: '字正腔圆的新闻主播', category: '成熟男声' },
+      { id: 'Eldric Sage', name: '沧明子', gender: '男', desc: '沉稳睿智的老者', category: '成熟男声' },
+      { id: 'Vincent', name: '田叔', gender: '男', desc: '沙哑烟嗓，江湖气', category: '成熟男声' },
+      { id: 'Kai', name: '凯', gender: '男', desc: '温润顺滑', category: '成熟男声' },
+      { id: 'Arthur', name: '徐大爷', gender: '男', desc: '质朴沙哑的乡土老者，满村奇闻异事', category: '成熟男声' },
+    ],
+  },
+  {
+    category: '甜美小姐姐',
+    voices: [
+      { id: 'Cherry', name: '芊悦', gender: '女', desc: '阳光积极、亲切自然', category: '甜美小姐姐' },
+      { id: 'Chelsie', name: '千雪', gender: '女', desc: '二次元虚拟女友', category: '甜美小姐姐' },
+    ],
+  },
+]
+
+// 扁平化列表，供按 id 反查中文名/描述（设置面板展示当前角色音色用）
+export const VOICE_OPTIONS: VoiceOption[] = VOICE_CATEGORY_GROUPS.flatMap(g => g.voices)
+
+// 自定义角色详情：前端「创建新角色」后立刻可用，持久化在 localStorage。
+// 真正落盘到 src/assets/roles 与 pictures/Role_Description 由后端接口负责（见前端 persistRoleToDisk）。
+export interface CustomRoleDetail {
+  personality: string
+  voiceId: string
+  imageDescription: string
 }
 
 export const getFileContent = async (name: string) => {
@@ -170,6 +351,16 @@ interface SettingsState {
     }
 
     customRoles: RoleOption[]
+    // 自定义角色详情（音色/性格/形象描述），键为角色名，持久化在 localStorage，
+    // 让「创建新角色」后角色在前端立即可用（详情不依赖后端落盘）。
+    customRoleDetails: Record<string, CustomRoleDetail>
+    // 正在后台创建中的角色（7 张情绪图 + 语音还没生成完）。
+    // 这期间调用它会缺资源，前端据此拦截并提示「角色未创建完毕」。
+    creatingRoles: string[]
+
+    // 运行时模式的后端镜像（见 AppMode）。页面挂载与打开设置面板时从后端同步，
+    // 不靠本地值推断，避免「手动改过后端开关文件但界面还显示旧状态」。
+    appMode: AppMode
 }
 
 // 定义一个名为 'settings' 的 store
@@ -202,7 +393,10 @@ export const useSettingsStore = defineStore('settings', {
             roleDescription: getDescriptionFile("Testificate"),
             roleImage: getImageUrl("Testificate", "neutral"),
         },
-        customRoles: []
+        customRoles: [],
+        customRoleDetails: {},
+        creatingRoles: [],
+        appMode: 'prod'
     }),
 
     // 定义 store 的动作
@@ -252,7 +446,42 @@ export const useSettingsStore = defineStore('settings', {
             if (index !== -1) {
                 this.customRoles[index] = updatedRole
             }
-        }
+        },
+
+        // 保存/更新自定义角色详情（前端立即可用；真正写盘由后端接口完成）
+        setCustomRoleDetail(roleName: string, detail: CustomRoleDetail): void {
+            this.customRoleDetails[roleName] = { ...detail }
+        },
+
+        // 标记/取消「正在创建」的角色
+        addCreatingRole(roleName: string): void {
+            if (!this.creatingRoles.includes(roleName)) {
+                this.creatingRoles.push(roleName)
+            }
+        },
+
+        removeCreatingRole(roleName: string): void {
+            this.creatingRoles = this.creatingRoles.filter(r => r !== roleName)
+        },
+
+        // 删除角色：前端状态一并清干净（后端落盘由 /api/roles/delete 负责）。
+        // 删掉的正是当前选中角色时，回退到内置默认角色 —— 角色名是出图 / 音频 /
+        // 人设的索引键，留在界面上只会指向一堆已经被删掉的文件。
+        purgeRole(roleName: string): void {
+            this.removeCustomRole(roleName)
+            delete this.customRoleDetails[roleName]
+            this.removeCreatingRole(roleName)
+            if (this.RoleConfig.roleName !== roleName) return
+            const fallback = defaultRole[0]
+            this.RoleConfig.roleName = fallback.value
+            this.RoleConfig.roleDescription = getDescriptionFile(fallback.value)
+            this.RoleConfig.roleImage = getImageUrl(fallback.value, 'neutral')
+        },
+
+        // 写入后端同步回来的运行时模式（只做镜像，真正切换走 utils/appMode.ts）
+        setAppMode(mode: AppMode): void {
+            this.appMode = mode
+        },
     },
 
     // 配置持久化选项

@@ -7,3 +7,20 @@ __pycache__/
 *.py[cod]
 /.idea
 .idea/.name
+
+# 密钥与本地端点配置：backend/.env 里有厂商 API Key、TTS token，
+# frontend/.env.local 里有 VITE_API_BASE / VITE_WS_TOKEN。
+# 未忽略时一条 `git add .` 就会把密钥提交上去。
+.env
+.env.local
+backend/.env
+frontend/.env.local
+
+# 运行时状态：Mock / 正式版开关（由 backend/config.py 读写）。
+# 属于本机状态而非源码，不该入库，否则会把别人的模式选择一起带走。
+backend/runtime_mode.json
+backend/runtime_mode.json.tmp
+
+# Mock 版每轮复制的固定测试音频（frontend/src/assets/voice/_mock/{角色}/）。
+# 纯运行期产物、且按定义与正式版素材重复，入库只是白白堆一份音频副本。
+frontend/src/assets/voice/_mock/

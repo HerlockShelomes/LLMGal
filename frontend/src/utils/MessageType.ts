@@ -1,4 +1,5 @@
 import { type Message } from "./api.ts"
+import { type AppMode } from "../stores/settings.ts"
 
 
 //Client to Server
@@ -80,11 +81,20 @@ export type ServerPayload = {
             tokens_used: number;
         };
         imageUrl: string;
+        // 产出这条回复的运行时模式。前端据此决定去哪个音频目录取本轮语音：
+        // mock -> voice/_mock/{角色}/，prod -> voice/{角色}/。
+        // 必须是「这条消息自己的」模式，不能用界面上的当前模式去猜——
+        // 响应在途时切模式、或回看历史消息，都会错配到另一个目录。
+        // 老后端不带这个字段，缺省按正式版处理（与改动前行为一致）。
+        mode?: AppMode;
     };
 
     [ServerMessageType.PROGRESS]: {
         progress: number;
-        status: "processing" | "generating"| "rendering";
+        status: "processing" | "generating"| "rendering" | "reasoning";
+        // 模型思考内容的流式增量片段。仅当 status === "reasoning" 时存在，
+        // 前端把它追加到当前正在生成的助手消息上，以灰色字体展示（非正式回复）。
+        reasoning?: string;
     };
     //传入后端的PROGRESS状态报文是否需要额外处理？
 

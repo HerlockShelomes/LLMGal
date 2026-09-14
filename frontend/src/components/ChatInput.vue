@@ -5,7 +5,7 @@ import { useChatStore } from '../stores/chat.ts'
 import { ElInput, ElMessage, ElMessageBox } from 'element-plus'
 import {
   useSettingsStore,
-  getImageUrl,
+  useRoleImage,
 } from '../stores/settings.ts'
 
 // 定义组件的属性
@@ -39,10 +39,9 @@ const messageText = ref('')
 const placeholder = `输入消息，按Enter发送
 Shift + Enter 换行`
 
-// 角色立绘：资源缺失时 getImageUrl 返回空串，v-if 才有意义
-const roleImageUrl = computed(() => getImageUrl(settings.RoleConfig.roleName, i.value))
-
-//要求这一部分跟随消息变换。
+// 情绪索引：跟随 props.ix 变化。
+// 必须声明在 useRoleImage 之前 —— 组合式函数内部的 watch 会立即求值一次，
+// 放在后面会读到尚未初始化的 i（TDZ 报错）。
 const i = ref<string>("neutral")
 watch(
     () => props.ix,
@@ -52,6 +51,13 @@ watch(
       console.log('索引已更新', newVal)
     },
     { immediate: true }
+)
+
+// 角色立绘：候选逐级回退（glob → dev 直连磁盘 → 后端 /static），
+// 全部失败时 url 为空串，此时才显示「+」占位符。
+const { url: roleImageUrl, onError: handleRoleImageError } = useRoleImage(
+    () => settings.RoleConfig.roleName,
+    () => i.value,
 )
 
 // 计算属性，用于获取聊天存储中的Token计数
@@ -252,7 +258,7 @@ onBeforeUnmount(releaseAllPreviewUrls)
 
       <div class="image-preview">
         <!---此处的index调用需要进行调用逻辑的修改，记得及时完成--->
-        <img v-if="roleImageUrl" :src="roleImageUrl" alt="Role">
+        <img v-if="roleImageUrl" :src="roleImageUrl" alt="Role" @error="handleRoleImageError">
         <span v-else class="place">+</span>
         <!---如果是引用放在public内的文件，就不需要目录回退。暂时原理并没特别理解，但至少要知道这一件事。--->
       </div>

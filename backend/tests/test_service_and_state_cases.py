@@ -34,7 +34,7 @@ def make_workspace(monkeypatch, tmp_path: Path, *, role="Wendy", index="3"):
 def prepare_collection(monkeypatch, tmp_path, *, answer=FIXED_REPLY, index="3"):
     _assets, records = make_workspace(monkeypatch, tmp_path, index=index)
     voice_calls = []
-    monkeypatch.setattr(Integration, "get_llm_response", lambda *_args: answer)
+    monkeypatch.setattr(Integration, "get_llm_response", lambda *_args, **_kwargs: answer)
     monkeypatch.setattr(
         Integration,
         "Voice_Generation_through_http",
@@ -188,7 +188,7 @@ def test_tc_tts_02_timeout_returns_empty_and_flow_continues(monkeypatch, tmp_pat
         raise requests.exceptions.Timeout("fixed timeout")
 
     monkeypatch.setattr(Voice.requests, "post", timeout)
-    monkeypatch.setattr(Integration, "get_llm_response", lambda *_args: FIXED_REPLY)
+    monkeypatch.setattr(Integration, "get_llm_response", lambda *_args, **_kwargs: FIXED_REPLY)
     monkeypatch.setattr(
         Integration, "Voice_Generation_through_http", Voice.Voice_Generation_through_http
     )
@@ -354,7 +354,7 @@ def test_tc_res_03_missing_records_falls_back_then_write_succeeds(monkeypatch, t
     voice_calls = []
     static_calls = []
     realtime_calls = []
-    monkeypatch.setattr(Integration, "get_llm_response", lambda *_args: FIXED_REPLY)
+    monkeypatch.setattr(Integration, "get_llm_response", lambda *_args, **_kwargs: FIXED_REPLY)
     monkeypatch.setattr(
         Integration,
         "Voice_Generation_through_http",
@@ -385,7 +385,7 @@ def test_tc_ex_01_missing_role_record_falls_back_without_crash(monkeypatch, tmp_
     monkeypatch.setattr(
         Integration,
         "get_llm_response",
-        lambda *_args: calls.append("llm") or FIXED_REPLY,
+        lambda *_args, **_kwargs: calls.append("llm") or FIXED_REPLY,
     )
     monkeypatch.setattr(Integration, "Voice_Generation_through_http", lambda *_args: "")
     monkeypatch.setattr(
@@ -409,7 +409,7 @@ def test_tc_ex_02_nonnumeric_index_fails_after_external_side_effects(monkeypatch
     monkeypatch.setattr(
         Integration,
         "get_llm_response",
-        lambda *_args: calls.append("llm") or FIXED_REPLY,
+        lambda *_args, **_kwargs: calls.append("llm") or FIXED_REPLY,
     )
     monkeypatch.setattr(
         Integration,
@@ -429,7 +429,7 @@ def test_tc_con_01_concurrent_requests_use_distinct_slots(monkeypatch, tmp_path)
     voice_slots = []
     updates = []
 
-    def fixed_llm(*_args):
+    def fixed_llm(*_args, **_kwargs):
         barrier.wait(timeout=5)
         return FIXED_REPLY
 

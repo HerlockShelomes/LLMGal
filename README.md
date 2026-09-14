@@ -76,6 +76,34 @@ LLMGal/
 
 前端设置面板中的 API Key 仅供前端直连接口相关功能使用，不能替代后端所需配置。
 
+## 一键部署（推荐）
+
+项目提供了部署脚本，自动创建 Python 3.11 虚拟环境并安装依赖（解释器版本会被脚本校验，非 3.11 会拒绝继续）：
+
+```bash
+# Linux / macOS / Windows(Git Bash)
+bash scripts/setup_env.sh                 # 仅后端运行时依赖
+bash scripts/setup_env.sh --with-test     # 额外安装后端测试依赖
+bash scripts/setup_env.sh --with-frontend # 额外执行前端 npm ci
+```
+
+Windows 用户也可直接双击 `scripts/setup_env.bat`（交互式，按需安装测试/前端依赖）。若想指定已存在的解释器或虚拟环境目录，可用环境变量：
+
+```bash
+LLMGAL_PYTHON=/path/to/python3.11 bash scripts/setup_env.sh
+LLMGAL_ENV_BACKEND=/path/to/venv      bash scripts/setup_env.sh
+```
+
+若想复刻本机名为 `vue-fastapi` 的 Conda 环境，可手动执行：
+
+```bash
+conda create -n vue-fastapi python=3.11 -y
+conda activate vue-fastapi
+pip install -r backend/requirements.txt
+```
+
+> 依赖说明：`backend/requirements.txt` 仅保留后端代码实际 import 的 7 个库（fastapi / starlette / pydantic / uvicorn / websockets / requests / openai）以及 `volcengine` 的其余运行时依赖。`volcengine` 本身由部署脚本以 `pip install --no-deps` 安装——因为它的元数据硬钉 `pycryptodome==3.9.9`（该版本在 CPython 3.11 无预编译轮子、需 VC++ 编译），而 `pycryptodome` 已改为钉带轮子的 `3.21.0`，故绕过其过度钉版本即可全新安装成功（已在干净 venv 实测）。原 `pip freeze` 中约 80% 的包（Flask、SQLAlchemy、redis、loguru 等）均未被项目使用，已移除。
+
 ## 快速开始
 
 ### 1. 启动后端
@@ -87,6 +115,8 @@ cd backend
 python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python -m pip install -r requirements.txt
+# volcengine 需以 --no-deps 安装，避开其过度钉的 pycryptodome==3.9.9（cp311 无轮子）
+python -m pip install --no-deps volcengine==1.0.192
 python -m uvicorn Connect:app --reload --host 127.0.0.1 --port 8000
 ```
 

@@ -76,7 +76,7 @@ class QueueWebSocket:
 async def run_socket(incoming, monkeypatch, response=None):
     websocket = QueueWebSocket(incoming)
     if response is not None:
-        monkeypatch.setattr(Connect, "process_query", lambda _request: response)
+        monkeypatch.setattr(Connect, "process_query", lambda *_args, **_kwargs: response)
     await Connect.websocket_chat(websocket)
     return websocket
 
@@ -94,7 +94,7 @@ def prepare_full_static_flow(monkeypatch, tmp_path: Path):
     for emotion, _description in Image.emo_image:
         (pictures_dir / f"Wendy_{emotion}.jpg").write_bytes(b"fixed-image")
     monkeypatch.chdir(backend_dir)
-    monkeypatch.setattr(Integration, "get_llm_response", lambda *_args: FIXED_REPLY)
+    monkeypatch.setattr(Integration, "get_llm_response", lambda *_args, **_kwargs: FIXED_REPLY)
 
     def fixed_tts(role, _voice, _emotion, _text, index):
         path = voice_dir / f"{role}_{index}_Stream.mp3"
@@ -148,7 +148,7 @@ async def test_tc_ws_04_non_client_query_rejected_without_side_effect(monkeypatc
     """TC-WS-04：非 client_query 消息被拒绝且连接可复用。"""
     calls = []
     monkeypatch.setattr(
-        Connect, "process_query", lambda request: calls.append(request) or fixed_response()
+        Connect, "process_query", lambda request, *_a, **_k: calls.append(request) or fixed_response()
     )
     wrong = valid_message()
     # 注意：canceled_request 已被后端作为控制帧处理（用户中止），
@@ -166,7 +166,7 @@ async def test_tc_ws_04_non_client_query_rejected_without_side_effect(monkeypatc
 async def test_tc_ws_05_missing_type_returns_server_error(monkeypatch):
     """TC-WS-05：缺少顶层 type 时进入 SERVER_ERROR。"""
     calls = []
-    monkeypatch.setattr(Connect, "process_query", lambda request: calls.append(request))
+    monkeypatch.setattr(Connect, "process_query", lambda request, *_a, **_k: calls.append(request))
     message = valid_message()
     del message["type"]
     websocket = await run_socket([message], monkeypatch)
@@ -178,7 +178,7 @@ async def test_tc_ws_05_missing_type_returns_server_error(monkeypatch):
 async def test_tc_ws_06_missing_payload_returns_server_error(monkeypatch):
     """TC-WS-06：缺少 payload 时进入 SERVER_ERROR。"""
     calls = []
-    monkeypatch.setattr(Connect, "process_query", lambda request: calls.append(request))
+    monkeypatch.setattr(Connect, "process_query", lambda request, *_a, **_k: calls.append(request))
     message = valid_message()
     del message["payload"]
     websocket = await run_socket([message], monkeypatch)
@@ -190,7 +190,7 @@ async def test_tc_ws_06_missing_payload_returns_server_error(monkeypatch):
 async def test_tc_ws_07_missing_required_payload_field(monkeypatch):
     """TC-WS-07：payload 缺少 role 时返回 VALIDATION_ERROR。"""
     calls = []
-    monkeypatch.setattr(Connect, "process_query", lambda request: calls.append(request))
+    monkeypatch.setattr(Connect, "process_query", lambda request, *_a, **_k: calls.append(request))
     message = valid_message()
     del message["payload"]["role"]
     websocket = await run_socket([message], monkeypatch)
@@ -252,7 +252,7 @@ async def test_tc_cfg_06_unknown_model_forwarded_then_rejected(monkeypatch):
     """TC-CFG-06：未知模型原样透传，服务拒绝后只回一条错误响应。"""
     received = []
 
-    def reject(model, *_args):
+    def reject(model, *_args, **_kwargs):
         received.append(model)
         raise RuntimeError("fixed provider rejection")
 

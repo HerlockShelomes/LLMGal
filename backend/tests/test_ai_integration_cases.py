@@ -94,7 +94,7 @@ class FakeWebSocket:
 async def run_socket(incoming, monkeypatch, *, response=None, query_params=None, headers=None):
     websocket = FakeWebSocket(incoming, query_params, headers)
     if response is not None:
-        monkeypatch.setattr(Connect, "process_query", lambda _request: response)
+        monkeypatch.setattr(Connect, "process_query", lambda *_args, **_kwargs: response)
     await Connect.websocket_chat(websocket)
     return websocket
 
@@ -191,7 +191,7 @@ def test_history_is_forwarded_to_llm(monkeypatch, tmp_path):
     make_workspace(monkeypatch, tmp_path)
     seen = {}
 
-    def fake_llm(model, role, prompt, history=None):
+    def fake_llm(model, role, prompt, history=None, on_reasoning=None):
         seen["history"] = history
         return FIXED_REPLY
 
@@ -261,7 +261,10 @@ def test_tts_qwen_provider_saves_audio(monkeypatch, tmp_path):
     assert result.endswith("Wendy_3_Stream.wav")
     assert (assets / "voice" / "Wendy" / "Wendy_3_Stream.wav").read_bytes() == b"fixed-wav-bytes"
     assert captured["json"]["input"]["text"] == "你好"
-    assert captured["json"]["input"]["voice"] == "Cherry"
+    # Wendy 在 config.ROLE_VOICES 里登记的是 Serena（每个角色一个音色），
+    # 它的优先级高于「火山音色 ID -> Qwen 音色」的兜底映射（那才会落到 Cherry）。
+    # 想验证兜底映射本身请看下面那个不传角色的用例。
+    assert captured["json"]["input"]["voice"] == "Serena"
     assert "generation" in captured["url"]
 
 
@@ -288,7 +291,7 @@ def test_tts_provider_default_is_configurable(monkeypatch, tmp_path):
 def test_009_tts_failure_downgrades_status_to_partial(monkeypatch, tmp_path):
     """缺陷 009：TTS 失败不能再谎报 success。"""
     make_workspace(monkeypatch, tmp_path)
-    monkeypatch.setattr(Integration, "get_llm_response", lambda *a: FIXED_REPLY)
+    monkeypatch.setattr(Integration, "get_llm_response", lambda *a, **_kwargs: FIXED_REPLY)
     monkeypatch.setattr(Integration, "Voice_Generation_through_http", lambda *a: "")
     monkeypatch.setattr(Integration, "static_images", lambda *a: "")
     result = call_collection()
@@ -298,7 +301,7 @@ def test_009_tts_failure_downgrades_status_to_partial(monkeypatch, tmp_path):
 def test_success_flow_reports_success(monkeypatch, tmp_path):
     """全部成功时状态为 success。"""
     make_workspace(monkeypatch, tmp_path)
-    monkeypatch.setattr(Integration, "get_llm_response", lambda *a: FIXED_REPLY)
+    monkeypatch.setattr(Integration, "get_llm_response", lambda *a, **_kwargs: FIXED_REPLY)
     monkeypatch.setattr(Integration, "Voice_Generation_through_http", lambda *a: "ok.mp3")
     monkeypatch.setattr(Integration, "static_images", lambda *a: "")
     assert call_collection()[4] == "success"
@@ -307,7 +310,7 @@ def test_success_flow_reports_success(monkeypatch, tmp_path):
 def test_b07_empty_image_url_must_not_clear_recent_url(monkeypatch, tmp_path):
     """缺陷 B07：没有新图时，Records 里已有的 Recent_Url 不能被空串覆盖。"""
     _assets, records = make_workspace(monkeypatch, tmp_path, url="old-url")
-    monkeypatch.setattr(Integration, "get_llm_response", lambda *a: FIXED_REPLY)
+    monkeypatch.setattr(Integration, "get_llm_response", lambda *a, **_kwargs: FIXED_REPLY)
     monkeypatch.setattr(Integration, "Voice_Generation_through_http", lambda *a: "ok.mp3")
     monkeypatch.setattr(Integration, "static_images", lambda *a: "")
     result = call_collection()
@@ -326,7 +329,7 @@ def test_n01_update_links_runs_inside_role_lock(monkeypatch, tmp_path):
     lock_states = []
     real_lock = Integration._lock_for("Wendy")
 
-    monkeypatch.setattr(Integration, "get_llm_response", lambda *a: FIXED_REPLY)
+    monkeypatch.setattr(Integration, "get_llm_response", lambda *a, **_kwargs: FIXED_REPLY)
     monkeypatch.setattr(Integration, "Voice_Generation_through_http", lambda *a: "ok.mp3")
     monkeypatch.setattr(Integration, "static_images", lambda *a: "")
 
@@ -343,7 +346,7 @@ def test_n01_update_links_runs_inside_role_lock(monkeypatch, tmp_path):
 def test_image_failure_downgrades_status(monkeypatch, tmp_path):
     """图片生成整体失败时同样降级为 partial。"""
     make_workspace(monkeypatch, tmp_path)
-    monkeypatch.setattr(Integration, "get_llm_response", lambda *a: FIXED_REPLY)
+    monkeypatch.setattr(Integration, "get_llm_response", lambda *a, **_kwargs: FIXED_REPLY)
     monkeypatch.setattr(Integration, "Voice_Generation_through_http", lambda *a: "ok.mp3")
 
     def boom(*_args):
@@ -535,7 +538,7 @@ async def test_process_query_runs_off_the_event_loop(monkeypatch):
     import threading
     thread_names = []
 
-    def blocking(_request):
+    def blocking(*_args, **_kwargs):
         thread_names.append(threading.current_thread().name)
         return fixed_response()
 

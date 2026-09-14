@@ -1,8 +1,11 @@
 import asyncio
+import os
 import websockets
 import json
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import time
 from fastapi.encoders import jsonable_encoder
@@ -15,6 +18,7 @@ from Voice import parse_response
 
 import config
 import Text
+import Create_New_Role
 
 # 连接管理器
 class WebSocketManager:
@@ -108,6 +112,10 @@ async def inner_websocket_operation(api_url, full_client, file_to_save):
 #     "response": "汝之眼眸如星河璀璨...",  // 模型生成的文本
 #     "emotion": "neutral",          // 情绪标签，具体可生成的情绪标签可参考Integration.py
 #     "index": "0",    // 资源标识符，在0-9之间循环，代表可使用实时生成的图片资源最大数量为10.
+#     "mode": "prod",  // 本轮回复由哪个运行时模式产出：prod=正式版 / mock=Mock 版（AI 旁路）。
+#                      // 前端按它决定去哪个音频目录取本轮语音（mock -> voice/_mock/{角色}/），
+#                      // 也就是「模式跟着消息走」；拿界面上的当前模式去猜，在「响应在途时切模式」
+#                      // 或「回看历史消息」两种情况下必然错配。
 #     "metrics": {
 #       "time_cost": 2.34,          // 单位：秒
 #       "tokens_used": 789
@@ -138,6 +146,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 后端生成物（候选形象、音色样本、情绪图）都写在 frontend/src/assets 下，
+# 而这些文件不在 Vite 的构建期 glob 快照里，dev 下前端拿不到 dist 路径。
+# 这里把它们挂成静态目录，前端统一用 <API_BASE>/static/... 访问，dev/prod 都能取到。
+# 路径基于本文件位置推导，换机器、换盘符都不用改。
+ASSETS_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'frontend', 'src', 'assets'))
+os.makedirs(ASSETS_DIR, exist_ok=True)
+app.mount('/static', StaticFiles(directory=ASSETS_DIR), name='static')
 
 
 @app.on_event("startup")
@@ -190,10 +207,13 @@ class ServerResponse(BaseModel):
     imageUrl: str
     # imageUrl: "https://xxxx.com" // 更新的图片url，现在传入可能意义不大，因为提取、写入、更新这几步，全是在后端完成。但保留这一项，
     #                              // 后续如果用户希望进一步节省内存，可以直接调用url。url失效时图片会消失，就调用文生图模型重新生成。
+    # 产出这一轮回复的运行时模式（'prod' / 'mock'）。随 payload 一起下发，
+    # 前端据此选择音频目录 —— 见文件顶部报文格式里 mode 的说明。
+    mode: str = "prod"
     # success / partial：语音或图片任一失败时降级为 partial（缺陷 009）
     status: str = "success"
 
-def process_query(request: ClientRequest) -> ServerResponse:
+def process_query(request: ClientRequest, on_reasoning=None) -> ServerResponse:
     """
     获取从前端传输的数据，
     调用已有的大语言模型获得回复
@@ -206,11 +226,18 @@ def process_query(request: ClientRequest) -> ServerResponse:
         metrics = default_metrics,
         imageUrl = ""
     )
+    # 记下这一轮实际生效的模式。放在 try 之前，任何返回路径都带上它；
+    # 前端不用（也没法可靠地）自己推断这条消息是哪套模式下产出的。
+    respond.mode = config.get_mode()
 
     try:
         startTime = time.time()
 
         # 第 7 个参数把多轮历史交给编排层，否则模型永远只看得到当前这一句。
+        # 第 8 个是会话标识：原先恒传 None，前端发来的 sessionId 被白白丢掉，
+        # 日志与 Mock 回执里都没有线索可用于对账，这里补上透传。
+        # on_reasoning 透传给编排层：推理模型每产生一段思考内容就实时回调，
+        # 由调用方（WebSocket 线程）经 stream_progress 推给前端做流式展示。
         response, indexStr, imageEmo, recentUrl, proc_status = Response_Collection(
                                                                       request.textModel_config["modelText"],
                                                                       request.imageModel_config["modelImage"],
@@ -218,7 +245,9 @@ def process_query(request: ClientRequest) -> ServerResponse:
                                                                       request.voiceCate,
                                                                       request.imageModel_config["realTimeRendering"],
                                                                       request.textModel_config["text"],
-                                                                      request.history)
+                                                                      request.history,
+                                                                      request.sessionId,
+                                                                      on_reasoning)
 
         respond.response = response
         respond.emotion = imageEmo
@@ -228,7 +257,9 @@ def process_query(request: ClientRequest) -> ServerResponse:
         stopTime = time.time()
         # 优先用模型返回的真实 token 用量；拿不到时退回按中文字符数粗估，
         # 并在字段上标注 est_ 前缀，避免把估算值当成真实用量。
-        usage = getattr(Text, "LAST_USAGE", None)
+        # Mock 版没有任何真实调用，Text.LAST_USAGE 里留的是上一轮正式版的残值，
+        # 直接拿来用会把历史用量记到这一轮头上。
+        usage = None if config.is_mock() else getattr(Text, "LAST_USAGE", None)
         if usage and usage.get("total_tokens"):
             respond.metrics["tokens_used"] = usage["total_tokens"]
             respond.metrics["tokens_used_est"] = False
@@ -285,6 +316,9 @@ def config_check():
     """启动自检：告诉前端/运维当前用的是哪套模型、还缺哪些密钥（不返回密钥本身）。"""
     return {
         "status": "alive",
+        "mode": config.get_mode(),
+        "mode_label": config.mode_label(),
+        "mock": config.is_mock(),
         "text_provider": config.TEXT_PROVIDER,
         "text_model": config.TEXT_MODEL,
         "tts_provider": config.TTS_PROVIDER,
@@ -292,6 +326,68 @@ def config_check():
         "auth_enabled": bool(config.WS_AUTH_TOKEN),
         "missing": config.missing_credentials(),
     }
+
+
+# --------------------------------------------------------------------------
+# 运行时模式（Mock / 正式版）
+#
+# 开关由前端设置页顶部的按钮调用；状态落盘在 backend/runtime_mode.json，
+# 因此 uvicorn --reload 重启进程后依然保持上一次的选择。
+# --------------------------------------------------------------------------
+class ModeRequest(BaseModel):
+    mode: str          # "mock" | "prod"
+
+
+def _mode_payload() -> dict:
+    return {
+        "mode": config.get_mode(),
+        "label": config.mode_label(),
+        "mock": config.is_mock(),
+        "text_provider": config.TEXT_PROVIDER,
+        "voice_provider": config.TTS_PROVIDER,
+        "image_provider": config.IMAGE_PROVIDER,
+    }
+
+
+@app.get('/api/system/mode')
+def api_get_mode():
+    """当前运行时模式。前端挂载时拉一次，保证界面显示与后端实际状态一致。"""
+    return _mode_payload()
+
+
+@app.post('/api/system/mode')
+def api_set_mode(req: ModeRequest):
+    """切换 Mock / 正式版，对之后每一轮对话立即生效。"""
+    try:
+        mode = config.set_mode(req.mode)
+    except ValueError as error:
+        return JSONResponse(status_code=400, content={"detail": str(error)})
+    except RuntimeError as error:
+        # 落盘失败：模式并没有真正切过去（get_mode 只认文件），绝不能回 200。
+        # config.set_mode 已记录堆栈，这里只需把它翻成前端能看懂的响应。
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"模式切换失败，开关未写入：{error}", "mode": config.get_mode()},
+        )
+    print(f"[模式切换] -> {config.mode_label()}")
+    payload = _mode_payload()
+    payload["status"] = "ok"
+    return payload
+
+
+def _mode_blocked(action: str) -> JSONResponse:
+    """Mock 版下明确拒绝会触发厂商调用的动作。
+
+    用 409（而不是静默降级或假装成功）：mock 的语义是「AI 不下场」，
+    让调用方清楚地看到被拦下来的原因，比返回一个来路不明的占位结果更可信。
+    """
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": f"当前为{config.mode_label()}，{action}暂不可用，请先在设置页切换回正式版。",
+            "mode": config.MODE_MOCK,
+        },
+    )
 
 @app.get("/voices")
 def list_voices():
@@ -304,6 +400,147 @@ def list_voices():
         ],
         "role_voices": config.ROLE_VOICES,
     }
+
+
+# --------------------------------------------------------------------------
+# 创建新角色（REST）
+#
+# 这几个接口刻意用 def（不是 async def）：内部是同步的 LLM / TTS / 图像网络调用，
+# FastAPI 会把它们丢进线程池，事件循环不会被卡住，WebSocket 对话照常可用。
+# --------------------------------------------------------------------------
+class GenerateImageRequest(BaseModel):
+    roleName: str
+    personality: str = ""
+    description: str = ""      # 用户自己填的形象描述，可为空（为空则由模型想象）
+    voiceId: str = ""
+    style: str = ""            # 画风，留空=二次元
+
+
+class CreateRoleRequest(BaseModel):
+    roleName: str
+    personality: str
+    description: str = ""      # 选中形象对应的描述（Subject/Appearance 两行）
+    voiceId: str = ""
+    selectedImage: str = ""    # temp 里被选中的文件名
+    style: str = ""
+
+
+class DeleteRoleRequest(BaseModel):
+    roleName: str
+
+
+@app.get('/api/voices/preview')
+def preview_voice(voice: str = ""):
+    """按音色返回试听样本；本地还没有就现合成一份再返回。"""
+    if not voice.strip():
+        return JSONResponse(status_code=400, content={"detail": "缺少音色参数"})
+    if config.is_mock():
+        # 已有样本是纯文件读取，照常返回；缺样本则明确拒绝，绝不现场合成。
+        existing = Create_New_Role.voice_sample_path(voice.strip())
+        if not os.path.exists(existing):
+            return _mode_blocked("音色试听")
+        return FileResponse(existing, media_type='audio/wav')
+    path = Create_New_Role.ensure_voice_sample(voice.strip())
+    if not path or not os.path.exists(path):
+        return JSONResponse(
+            status_code=502,
+            content={"detail": f"音色「{voice}」的试听样本生成失败，请检查 TTS 配置"},
+        )
+    return FileResponse(path, media_type='audio/wav')
+
+
+@app.post('/api/roles/generate-image')
+def api_generate_image(req: GenerateImageRequest):
+    """生成一张候选形象 -> pictures/temp/<角色>_<index>.jpg。
+
+    耗时长（LLM 扩写 + 出图），前端在此期间显示旋转加载条。
+    """
+    name = (req.roleName or '').strip()
+    if not name:
+        return JSONResponse(status_code=400, content={"detail": "缺少角色名称"})
+    if config.is_mock():
+        # 这条链路要调 LLM 扩写 + 文生图，mock 下整体拦下
+        return _mode_blocked("生成角色形象")
+    try:
+        return Create_New_Role.generate_candidate_image(
+            name, req.personality, req.voiceId, req.description, req.style,
+        )
+    except Exception as error:
+        logging.exception("生成候选形象失败")
+        return JSONResponse(status_code=502, content={"detail": f"生成形象失败：{error}"})
+
+
+@app.get('/api/roles/temp-images')
+def api_list_temp_images(role: str = ""):
+    """列出该角色已生成的所有候选形象，供前端下拉检索。"""
+    name = (role or '').strip()
+    if not name:
+        return {"images": []}
+    return {"images": Create_New_Role.list_temp_images(name)}
+
+
+@app.post('/api/roles/create')
+def api_create_role(req: CreateRoleRequest):
+    """启动角色定稿（后台线程），立即返回，不阻塞前端。"""
+    name = (req.roleName or '').strip()
+    if not name:
+        return JSONResponse(status_code=400, content={"detail": "缺少角色名称"})
+    if config.is_mock():
+        # 定稿会生成形象描述 + 7 张情绪图 + 打招呼语音，全套都是厂商调用
+        return _mode_blocked("创建角色")
+    Create_New_Role.start_finalize(
+        name, req.personality, req.description, req.voiceId, req.selectedImage, req.style,
+    )
+    return {"status": "creating", "role": name}
+
+
+@app.get('/api/roles/status')
+def api_role_status(role: str = ""):
+    """查询创建进度：creating / ready / failed。"""
+    name = (role or '').strip()
+    if name:
+        return Create_New_Role.get_status(name)
+    return Create_New_Role.ROLE_CREATION_STATUS
+
+
+@app.post('/api/roles/delete')
+def api_delete_role(req: DeleteRoleRequest):
+    """删除一个自定义角色：角色信息、图片、语音、Records 与后端登记一并清掉。
+
+    刻意**不做 mock 拦截**：删除是纯本地文件操作，不调用任何厂商服务，
+    mock 版（AI 旁路）下同样应该能用。
+
+    状态码：400 角色名非法 / 403 内置角色 / 409 正在创建中 / 502 删除过程出错。
+    """
+    name = (req.roleName or '').strip()
+    if not name:
+        return JSONResponse(status_code=400, content={"detail": "缺少角色名称"})
+    try:
+        return Create_New_Role.delete_role(name)
+    except PermissionError as error:
+        return JSONResponse(status_code=403, content={"detail": str(error)})
+    except ValueError as error:
+        return JSONResponse(status_code=400, content={"detail": str(error)})
+    except Create_New_Role.RoleBusyError as error:
+        return JSONResponse(status_code=409, content={"detail": str(error)})
+    except Exception as error:
+        logging.exception("删除角色失败")
+        return JSONResponse(status_code=502, content={"detail": f"删除角色失败：{error}"})
+
+
+@app.get('/api/roles/list')
+def api_list_roles():
+    """后端磁盘上真实存在的自定义角色清单（内置角色不含在内）。
+
+    前端 localStorage 里的角色列表只是缓存，刷新时拿这份权威名单对账，
+    把磁盘上已经不存在的角色从下拉框摘掉 —— 否则会出现「明明删了、
+    列表里还在、再点删除又没反应」的错觉。
+    """
+    try:
+        return {"roles": Create_New_Role.list_custom_roles()}
+    except Exception as error:
+        logging.exception("角色清单读取失败")
+        return JSONResponse(status_code=502, content={"detail": f"角色清单读取失败：{error}"})
 
 
 @app.websocket("/ws/chat")
@@ -409,7 +646,34 @@ async def websocket_chat(websocket: WebSocket):
                     # 缺陷 B03：Response_Collection 内部是同步的网络调用（LLM/TTS/图像），
                     # 直接在事件循环里跑会把整个服务阻塞住，并发一超 1 就假死。
                     # 这里卸载到线程池，事件循环继续处理心跳与取消。
-                    resp = await asyncio.to_thread(process_query, client_request)
+
+                    # 思考内容流式推送：process_query 在线程池里跑，on_reasoning 回调也在
+                    # 工作线程触发；用 run_coroutine_threadsafe 把 send_json 调度回事件循环，
+                    # 否则在工作线程里直接 await 会报错。仅推理模型会产生思考内容。
+                    loop = asyncio.get_running_loop()
+                    req_id = message.get('message_id', '')
+
+                    async def _stream_reasoning(delta: str) -> None:
+                        try:
+                            await websocket.send_json({
+                                "type": "stream_progress",
+                                "message_id": req_id,
+                                "status": "success",
+                                "payload": {
+                                    "progress": 0,
+                                    "status": "reasoning",
+                                    "reasoning": delta,
+                                },
+                            })
+                        except Exception:  # pragma: no cover - 连接异常不应中断主流程
+                            logging.warning("思考内容推送失败（连接可能已断开）")
+
+                    def on_reasoning(delta: str) -> None:
+                        if not delta:
+                            return
+                        asyncio.run_coroutine_threadsafe(_stream_reasoning(delta), loop)
+
+                    resp = await asyncio.to_thread(process_query, client_request, on_reasoning)
                 except Exception as e:
                     logging.error(f'处理查询失败: {str(e)}')
                     await send_error(
@@ -431,6 +695,9 @@ async def websocket_chat(websocket: WebSocket):
                         "response": resp.response,
                         "emotion": resp.emotion,
                         "index": resp.index,
+                        # 模式随消息下发：前端据此决定去 voice/_mock/{角色}/ 还是
+                        # voice/{角色}/ 取本轮音频，避免「消息与当前模式对不上」。
+                        "mode": resp.mode or config.get_mode(),
                         "metrics":{
                             "time_cost": resp.metrics['time_cost'],
                             "tokens_used": resp.metrics['tokens_used'],

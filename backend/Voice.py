@@ -55,11 +55,17 @@ EMOTION_TO_CHINESE = {
 def resolve_qwen_voice(volc_voice: str, role: str = "") -> str:
     """决定本次合成用哪个 Qwen3-TTS 音色。
 
-    优先级：角色名登记的专属音色 > 火山音色 ID 映射 > 全局默认。
+    优先级：显式 Qwen 音色名 > 角色名登记的专属音色 > 火山音色 ID 映射 > 全局默认。
 
     前端原先对所有角色都发同一个 voiceCate，四个角色说话一模一样。
     现在以角色为主键，未登记的角色仍走原来的 voiceCate 映射，行为不变。
+
+    注意第一条不能省：调用方直接给 Qwen 音色名时（试听样本、手动指定）必须原样使用。
+    否则它会落到 VOLC_TO_QWEN_VOICE 里查 key（那是火山 ID 的表）→ 查不到 → 回落到
+    全局默认音色。试听样本曾因此 24 条全部用 Cherry 合成，听起来完全一样。
     """
+    if volc_voice and volc_voice in config.QWEN_VOICE_CATALOG:
+        return volc_voice
     role_voice = config.resolve_role_voice(role, "")
     if role_voice:
         return role_voice
@@ -276,7 +282,27 @@ def save_audio_from_bytes(audio: bytes, role, index, ext: str = "mp3") -> str:
     return savePath
 
 
-def _tts_qwen(r, v, e, t, i):
+def save_audio_file(audio: bytes, path: str) -> str:
+    """把音频字节写到**指定路径**（用于音色试听样本等自定义落盘位置）。
+
+    与 save_audio_from_bytes 的区别：后者按「角色/序号」约定拼路径，
+    试听样本不属于任何角色，必须允许调用方直接给完整路径。
+    """
+    if not audio:
+        print("音频数据为空，跳过保存")
+        return ""
+
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, 'wb') as audio_file:
+        audio_file.write(audio)
+
+    print("音频已保存: ", path)
+    return path
+
+
+def _tts_qwen(r, v, e, t, i, save_path: str = ""):
     """阿里百炼 Qwen3-TTS（DashScope 多模态生成接口）。
 
     每月 100 万字符免费，国内账号、免信用卡，是本项目测试期语音成本归零的关键。
@@ -330,19 +356,25 @@ def _tts_qwen(r, v, e, t, i):
         # 非流式响应不回 base64，音频在临时链接上，需二次下载（会过期，立即取）
         audio_resp = requests.get(url=audio_url, timeout=60)
         audio_resp.raise_for_status()
+        if save_path:
+            return save_audio_file(audio_resp.content, save_path)
         return save_audio_from_bytes(audio_resp.content, r, i, ext="wav")
 
     if audio.get("data"):
+        if save_path:
+            return save_audio_file(base64.b64decode("".join(audio["data"].split()), validate=True), save_path)
         return save_audio_from_base64(audio["data"], r, i, ext="wav")
 
     raise RuntimeError(f"语音服务未返回音频地址：{response.text[:200]}")
 
 
-def Voice_Generation_through_http(r, v, e, t, i, provider=None):
+def Voice_Generation_through_http(r, v, e, t, i, provider=None, save_path: str = ""):
     """语音合成统一入口。
 
     :param provider: 覆盖 config.TTS_PROVIDER，可选 "qwen" / "volcengine"。
                      单元测试会显式指定，避免默认 provider 变化影响既有断言。
+    :param save_path: 可选。给定时把音频写到该路径，而不是按「角色/序号」拼路径。
+                      音色试听样本不属于任何角色，需要这个出口。
     :return: 成功返回音频文件路径，失败返回空串（调用方据此把状态降级为 partial）。
     """
     selected = (provider or config.TTS_PROVIDER or "qwen").lower()
@@ -351,8 +383,8 @@ def Voice_Generation_through_http(r, v, e, t, i, provider=None):
 
     try:
         if selected == "volcengine":
-            return _tts_volcengine(r, v, e, clean_text, i)
-        return _tts_qwen(r, v, e, clean_text, i)
+            return _tts_volcengine(r, v, e, clean_text, i, save_path=save_path)
+        return _tts_qwen(r, v, e, clean_text, i, save_path=save_path)
     except requests.exceptions.RequestException as error:
         print(f'Request Failed: {error}')
         return ''
@@ -366,7 +398,7 @@ def Voice_Generation_through_http(r, v, e, t, i, provider=None):
         return ''
 
 
-def _tts_volcengine(r, v, e, t, i):
+def _tts_volcengine(r, v, e, t, i, save_path: str = ""):
 
     httpurl = "https://openspeech.bytedance.com/api/v1/tts"
 
@@ -414,6 +446,10 @@ def _tts_volcengine(r, v, e, t, i):
         response_data = response.json()
         if 'data' in response_data:
             base64_audio = response_data['data']
+            if save_path:
+                return save_audio_file(
+                    base64.b64decode("".join(base64_audio.split()), validate=True), save_path
+                )
             return save_audio_from_base64(base64_audio, r, i)
         else:
             print("Error: No Audio Found.")

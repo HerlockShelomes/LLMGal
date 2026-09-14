@@ -4,6 +4,7 @@ import threading
 import traceback
 
 import config
+import MockMode
 from Text import get_llm_response
 from Voice import Voice_Generation_through_http
 from Image import emotional_bro
@@ -152,7 +153,7 @@ def updateLinks(roleName, updatedUrl, updatedIndex):
     _write_records_lines(lines)
 
 
-def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGeneration, text, history=None, sessionId=None):
+def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGeneration, text, history=None, sessionId=None, on_reasoning=None):
     """
     现阶段设计下，模型应该只支持中文对话。后续应当如何更改提升泛化能力？
     :param textModel: 指示此次生成所使用的文本模型。
@@ -173,6 +174,14 @@ def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGene
              状态为 success / partial：语音或图片任一失败即降级为 partial，
              不再像缺陷 009 那样失败也谎报 success。
     """
+
+    # Mock 版：AI 不下场。必须放在最前面 —— 角色锁、Records 读写、LLM、TTS、
+    # 图像生成，一个都不能碰。这样「切到 mock 后不再产生任何厂商调用」是结构上
+    # 的事实，而不是靠调用方自觉。返回契约与正式版完全一致，前端无需区分。
+    if config.is_mock():
+        return MockMode.build_mock_response(
+            roleName, text, voiceName, history, sessionId
+        )
 
     with _lock_for(roleName):
         try:
@@ -214,7 +223,9 @@ def Response_Collection(textModel, imageModel, roleName, voiceName, realTimeGene
 
     # 项目此前零多轮记忆：只发当前这一句，模型窗口再大也用不上。
     # 现在把前端传来的历史一并交给模型（清洗与长度限制在 Text.sanitize_history 内）。
-    answer = get_llm_response(textModel, roleName, text, history)
+    # on_reasoning 透传给 LLM 层：推理模型每产生一段思考内容就实时回调，
+    # 由 Connect 侧经 WebSocket 推给前端做流式展示；非推理模型不会触发。
+    answer = get_llm_response(textModel, roleName, text, history, on_reasoning)
 
     pattern = r'\((.*?)\)'
     try:
