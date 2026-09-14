@@ -1,5 +1,6 @@
 fastapi==0.95.1
-pydantic==1.10.7
+# FastAPI 0.95.x requires Pydantic 1.x; the latest 1.x release supports newer Python interpreters.
+pydantic==1.10.26
 pytest==8.4.1
 pytest-asyncio==1.0.0
 pytest-cov==6.2.1

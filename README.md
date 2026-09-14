@@ -119,7 +119,9 @@ LLMGal/
 │   │   └── test_service_and_state_cases.py  # 文本、语音、图片和资源状态测试（20 条）
 │   └── requirements-test.txt                # 独立测试依赖
 ├── scripts/
-│   └── run_module1_tests.sh                 # 一键运行全部 34 条用例
+│   ├── run_module1_tests.py                 # 跨平台测试启动器
+│   ├── run_module1_tests.sh                 # macOS/Linux 入口
+│   └── run_module1_tests.bat                # Windows 入口
 └── docs/module1/
     └── LLMGal_backend_34_test_cases.md       # 34 条测试用例清单
 ```
@@ -132,17 +134,44 @@ LLMGal/
 
 测试函数名直接包含清单编号。例如，清单中的 `TC-WS-01` 对应 `test_tc_ws_01_valid_static_request_full_flow`，可以据此从用例清单定位到具体代码。
 
-在仓库根目录执行以下命令，即可自动创建 Python 3.11 虚拟环境、安装精简测试依赖并运行全部 34 个后端单元测试：
+#### 一键启动（模块一）
 
-```bash
-./scripts/run_module1_tests.sh
+前置条件：安装 Python 3.9+；首次运行需能够访问 Python 包源安装依赖。**不需要启动后端、不需要 API Key，也不会调用真实 LLM/TTS 服务。**
+
+在 `LLMGal` 仓库根目录按平台执行一条命令：
+
+| 平台 | 启动命令 |
+| --- | --- |
+| macOS / Linux | `./scripts/run_module1_tests.sh` |
+| Windows PowerShell / CMD | `scripts\run_module1_tests.bat` |
+| 所有平台（推荐的通用入口） | `python scripts/run_module1_tests.py` |
+
+启动器会自动创建或复用 `.venv-module1`、安装/更新测试依赖、执行 `backend/tests/` 的 34 条用例，并生成日志与 JUnit 结果。正常基线为：
+
+```text
+32 passed, 2 xfailed
 ```
 
-如需显示每条用例名称：
+常用命令：
 
 ```bash
-./scripts/run_module1_tests.sh -v
+# 显示每条用例名称
+python scripts/run_module1_tests.py -v
+
+# 指定 Python 解释器
+python scripts/run_module1_tests.py --python python3.12
+
+# Python 版本切换、环境损坏或依赖异常时，强制重建测试虚拟环境
+python scripts/run_module1_tests.py --recreate-venv
 ```
+
+也可在 macOS/Linux 上通过环境变量指定解释器：
+
+```bash
+LLMGAL_TEST_PYTHON=/path/to/python3.12 ./scripts/run_module1_tests.sh
+```
+
+如果 `.venv-module1` 的 Python 主次版本与当前启动器不同，启动器会自动重建它，避免复用错误解释器。
 
 34 个测试函数与 [`docs/module1/LLMGal_backend_34_test_cases.md`](docs/module1/LLMGal_backend_34_test_cases.md) 中的用例编号一一对应，覆盖配置映射、情绪解析、资源索引边界、静态与实时图像分支、文本提示词、语音保存、HTTP 请求结构、健康检查及 WebSocket 错误协议。文本模型、语音和图像相关依赖均使用固定 Mock/Stub；测试夹具会阻断遗漏的真实 HTTP 与 WebSocket 调用，因此不需要 API Key，不会调用真实大模型或产生第三方服务费用。
 
@@ -154,12 +183,6 @@ LLMGal/
 
 - `artifacts/test-results/pytest-output.txt`：终端执行日志与覆盖率摘要
 - `artifacts/test-results/module1-junit.xml`：可供持续集成或报告工具读取的 JUnit 结果
-
-如果 Python 3.11 的命令名称不同，可以显式指定解释器：
-
-```bash
-LLMGAL_TEST_PYTHON=/path/to/python3.11 ./scripts/run_module1_tests.sh
-```
 
 ### 前端测试
 
