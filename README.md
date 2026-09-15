@@ -1,316 +1,339 @@
 # LLMGal
 
-LLMGal 是一个基于大语言模型 API 的多模态角色聊天原型。用户可以选择角色、文本模型、音色和图像模式；系统生成角色化文本回复，并配套合成语音与情绪图片，提供更具沉浸感的对话体验。
+LLMGal 是一个基于大语言模型 API 的多模态角色聊天原型。用户可以选择角色、文本模型、音色和图像模式；后端生成角色化文本回复，并配套合成语音与情绪图片，前端通过 WebSocket 展示完整对话流程。
 
-> 项目目前处于开发原型阶段，适合作为软件测试与质量保证课程的被测对象，不建议直接用于生产环境。
+> 项目目前处于课程实践和开发原型阶段，适合作为软件测试与质量保证课程的被测对象，不建议直接用于生产环境。
 
 ![LLMGal 页面截图](WebPage_Image.png)
 
-## 核心功能
+## 功能与技术栈
 
-- 四个预置角色及独立角色提示词
-- 基于 WebSocket 的前后端双向通信
-- 可切换的文本模型、音色与图像生成模式
-- 从回复中提取情绪并匹配角色图片
-- 实时语音合成与本地音频缓存
-- 静态情绪图片与实时图像生成两种路径
-
-## 系统架构
+- Vue 3、TypeScript、Vite、Pinia、Element Plus 前端
+- FastAPI + WebSocket 后端
+- OpenAI 兼容文本模型接口
+- Qwen/火山引擎语音合成
+- 静态情绪图片与实时图像生成
+- Mock/正式版运行模式切换
+- 自定义角色创建、清点与删除
 
 ```mermaid
 flowchart LR
     U[用户] --> F[Vue 3 前端]
-    F <-->|WebSocket /ws/chat| B[FastAPI 后端]
+    F <-->|REST + WebSocket| B[FastAPI 后端]
     B --> L[文本模型 API]
     B --> T[语音合成 API]
     B --> I[图像生成 API]
-    B --> A[角色提示词与媒体资源]
+    B <--> A[角色提示词与媒体资源]
     A --> F
 ```
-
-前端使用 Vue 3、TypeScript、Vite、Pinia 和 Element Plus；后端使用 Python、FastAPI 和 WebSocket，并通过 OpenAI 兼容接口与火山引擎相关服务完成文本、语音和图像处理。
 
 ## 项目结构
 
 ```text
 LLMGal/
 ├── backend/
-│   ├── Connect.py          # FastAPI 应用、健康检查和 WebSocket 入口
-│   ├── Integration.py      # 文本、语音、图像处理流程编排
-│   ├── Text.py             # 角色提示词读取与文本模型调用
-│   ├── Voice.py            # 语音合成与音频保存
-│   ├── Image.py            # 情绪图片选择与图像生成
-│   ├── test_websocket.py   # WebSocket 端到端测试
-│   ├── pytest.ini          # pytest 配置
-│   └── requirements.txt    # Python 依赖
+│   ├── Connect.py                  # FastAPI 应用、REST 和 WebSocket 入口
+│   ├── Integration.py              # 文本、语音、图像流程编排
+│   ├── Text.py / Voice.py / Image.py
+│   ├── config.py                   # .env、Provider 和运行模式配置
+│   ├── tests/                      # 后端传统测试与扩展回归测试
+│   ├── tests_ai/run_ai_tests.py    # 模块二“测 AI”测试入口
+│   ├── test_websocket.py           # 连接真实服务的端到端测试
+│   └── requirements*.txt
 ├── frontend/
-│   ├── src/components/     # 页面组件
-│   ├── src/views/          # 聊天主视图
-│   ├── src/stores/         # Pinia 状态管理
-│   ├── src/utils/          # API、WebSocket 与消息处理工具
-│   ├── src/assets/         # 角色提示词、图片、语音和样式
-│   ├── src/_tests_/        # Vitest 测试
-│   └── package.json        # 前端依赖与脚本
-├── WebPage_Image.png       # 页面截图
-├── Vue-FastAPI.png         # 服务流程图
+│   ├── src/components/             # 页面组件
+│   ├── src/views/                  # 聊天视图
+│   ├── src/stores/                 # Pinia 状态
+│   ├── src/utils/                  # REST、WebSocket、音频等工具
+│   ├── src/_tests_/                # Vitest 前端测试
+│   └── package.json
+├── scripts/
+│   ├── setup_local.py              # 跨平台本地初始化
+│   ├── start_backend.py            # 后端启动入口
+│   └── run_module1_tests.*         # 模块一 34 条测试的一键入口
+├── docs/module1/                   # 模块一用例、报告与配置说明
+├── artifacts/                      # 测试报告和调试产物
 └── README.md
 ```
 
 ## 环境要求
 
-- Python 3.11–3.14（推荐 3.11 或 3.12；不支持 Python 3.10 及更早版本）
-- Node.js 18 或更高版本（建议使用 Node.js LTS）
-- npm 9 或更高版本
-- 可访问所配置文本、语音和图像服务的网络环境
+- **Python 3.11**。后端运行依赖锁定了 FastAPI 0.95.1 和 Pydantic 1.10.7，请不要使用 Python 3.12 及以上版本创建运行环境。
+- **Node.js 22 LTS**（推荐项目 CI 使用的 22.13.1）。Node.js 18+ 可以安装依赖，但 Node.js 25 会导致当前 jsdom/Vitest 的 `localStorage` 兼容错误。
+- npm 10 或更高版本。
+- 正式版聊天需要能够访问所配置模型服务的网络环境；Mock 模式和隔离测试不需要 API Key。
 
-项目不需要 MySQL、Redis 或其他数据库即可体验聊天功能。运行时依赖已与历史开发依赖拆分；首次部署无需安装数据库客户端或 C/C++ 编译工具。
-
-## 配置说明
-
-完整多模态流程依赖文本模型、语音合成与可选的实时图像服务。服务配置统一由 `backend/config.py` 从 `backend/.env` 或系统环境变量读取；环境变量优先于 `.env`，便于本地开发和 CI 部署。
-
-使用前请完成以下工作：
-
-1. 复制 `backend/.env.example` 为 `backend/.env`，填写仅用于开发或测试的凭据；初始化脚本会在 `.env` 缺失时自动完成复制。
-2. 至少配置一个文本模型密钥；若要听到语音，再配置 TTS 密钥。普通聊天默认使用静态情绪图，未配置图像服务也可体验文本与语音。
-3. `.env` 与 `frontend/.env.local` 已被 Git 忽略，禁止提交真实密钥。
-4. 若启用 `WS_AUTH_TOKEN`，还须将相同值写入 `frontend/.env.local` 的 `VITE_WS_TOKEN`。
-
-前端设置面板中的 API Key 仅供前端直连接口相关功能使用，不能替代后端所需配置。
+项目不依赖 MySQL、Redis 或其他数据库。
 
 ## 快速开始
 
-### 推荐：一键初始化
+以下命令除非特别说明，均在 **LLMGal 仓库根目录**执行。
 
-克隆仓库后，在 **LLMGal 仓库根目录**执行：
-
-```bash
-python scripts/setup_local.py
-```
-
-该命令会：
-
-1. 校验 Python 版本，并创建或复用 `backend/.venv`；
-2. 安装最小后端运行时依赖，不安装 MySQL/Redis 等无关历史依赖；
-3. 在缺失时从 `.env.example` 创建 `backend/.env`，且绝不覆盖已有本地配置；
-4. 通过 `npm ci` 安装前端锁定依赖。
-
-常用选项：
+### 1. 克隆项目
 
 ```bash
-# 当前 python 不是目标版本时，明确指定解释器
-python scripts/setup_local.py --python python3.11
-
-# 仅部署后端或前端
-python scripts/setup_local.py --backend-only
-python scripts/setup_local.py --frontend-only
-
-# 虚拟环境损坏或切换 Python 主次版本后重建
-python scripts/setup_local.py --recreate-venv
+git clone https://github.com/HerlockShelomes/LLMGal.git
+cd LLMGal
 ```
 
-Windows PowerShell / CMD 同样使用：
+### 2. 一键初始化前后端
 
-```powershell
-py scripts\setup_local.py
+macOS / Linux：
+
+```bash
+python3.11 scripts/setup_local.py
 ```
 
-若 Windows 中 `py` 默认指向不支持的 Python，请指定受支持版本来运行启动器：
+Windows PowerShell / CMD：
 
 ```powershell
 py -3.11 scripts\setup_local.py
 ```
 
-### 1. 配置本地密钥
+初始化脚本会：
 
-打开 `backend/.env`，按注释填写密钥。最小可用组合通常是：
+1. 创建或复用 `backend/.venv`；
+2. 安装 `backend/requirements.txt`；
+3. 在缺失时复制 `backend/.env.example` 为 `backend/.env`，不会覆盖已有配置；
+4. 在 `frontend/` 中执行 `npm ci`。
+
+只初始化一侧或重建后端虚拟环境：
+
+```bash
+python3.11 scripts/setup_local.py --backend-only
+python3 scripts/setup_local.py --frontend-only
+python3.11 scripts/setup_local.py --recreate-venv
+```
+
+### 3. 配置服务
+
+编辑初始化脚本生成的 `backend/.env`。正式版聊天至少要配置文本模型密钥；需要语音时还要配置 TTS 密钥。例如：
 
 ```env
 TEXT_PROVIDER=zhipu
-ZHIPU_API_KEY=你的文本模型开发密钥
+ZHIPU_API_KEY=你的智谱开发密钥
 TTS_PROVIDER=qwen
-DASHSCOPE_API_KEY=你的语音服务开发密钥
+DASHSCOPE_API_KEY=你的阿里百炼开发密钥
 ```
 
-如果只希望确认服务能启动、不发起聊天请求，也可以暂不填写密钥。服务启动后会在控制台及 `/health/config` 中报告缺失项，但不会打印密钥内容。
+未填写密钥时后端仍可启动，并可在前端切换到 Mock 模式进行无费用演示。访问 `http://127.0.0.1:8000/health/config` 可检查当前 Provider、模型和缺失配置，接口不会返回密钥内容。
 
-### 2. 启动后端
-
-在仓库根目录打开终端 A：
+默认前端配置已连接本机 8000 端口。仅在修改端口、地址或启用 WebSocket 鉴权时，复制前端配置：
 
 ```bash
-python scripts/start_backend.py
+cp frontend/.env.example frontend/.env.local
 ```
 
-启动脚本会自动使用 `backend/.venv`，并从正确的 `backend` 工作目录运行，避免相对资源路径错误。浏览器访问：
+Windows：
 
-- <http://127.0.0.1:8000/>：返回 `{"status":"alive"}` 表示服务已启动；
-- <http://127.0.0.1:8000/health/config>：显示已选 Provider、模型及缺失配置，不显示密钥。
+```powershell
+copy frontend\.env.example frontend\.env.local
+```
 
-普通启动默认关闭热重载，以兼容受限目录、容器和部分 Windows 文件监视器环境；本地开发需要自动重启时，在 `backend/.env` 中设置 `DEV_RELOAD=1` 后重启后端。
+若后端设置了 `WS_AUTH_TOKEN`，请把同一个值写入 `frontend/.env.local` 的 `VITE_WS_TOKEN`。若修改后端 `PORT`，还要同步修改 `VITE_WS_URL` 和 `VITE_API_BASE`。
 
-### 3. 启动前端
+### 4. 启动后端
 
-保持后端终端运行，再打开终端 B：
+终端 A：
+
+```bash
+python3 scripts/start_backend.py
+```
+
+Windows：
+
+```powershell
+py scripts\start_backend.py
+```
+
+`start_backend.py` 会自动调用 `backend/.venv` 中的 Python，并把工作目录切到 `backend/`，无需手动激活虚拟环境。启动成功后可访问：
+
+- `http://127.0.0.1:8000/`：应返回 `{"status":"alive"}`；
+- `http://127.0.0.1:8000/health/config`：查看安全的配置自检结果。
+
+默认关闭热重载。开发时可在 `backend/.env` 中设置 `DEV_RELOAD=1` 后重启后端。
+
+### 5. 启动前端
+
+保持后端运行，在终端 B 执行：
 
 ```bash
 npm --prefix frontend run dev
 ```
 
-按终端显示的地址打开页面。前端默认连接 `ws://localhost:8000/ws/chat`；选择角色并保存设置后即可发起对话。
+Vite 默认地址为 `http://localhost:5173/`。停止任一服务请在对应终端按 `Ctrl+C`。
 
-若后端开启了 `WS_AUTH_TOKEN`，复制 `frontend/.env.example` 为 `frontend/.env.local`，并填写与后端相同的令牌后重启前端。
+### 可选：安装火山图像 SDK
 
-### 可选：火山图像 SDK
-
-只有当 `backend/.env` 中指定 `IMAGE_PROVIDER=volcengine` 时，才需要额外安装厂商 SDK：
+仅当 `backend/.env` 设置 `IMAGE_PROVIDER=volcengine` 时安装：
 
 ```bash
 backend/.venv/bin/python -m pip install -r backend/requirements-volcengine.txt
 ```
 
-Windows 请将 `backend/.venv/bin/python` 替换为 `backend\.venv\Scripts\python.exe`。使用默认智谱图像服务或关闭实时绘图时不需要此步骤。
+Windows：
 
-## 测试与质量检查
-
-### 模块一：隔离自动化测试
-
-模块一测试工程位于以下路径：
-
-```text
-LLMGal/
-├── backend/
-│   ├── tests/
-│   │   ├── conftest.py                      # 公共 Mock、Stub 和网络阻断配置
-│   │   ├── test_websocket_cases.py          # WebSocket、配置、异常和 ACK 测试（14 条）
-│   │   └── test_service_and_state_cases.py  # 文本、语音、图片和资源状态测试（20 条）
-│   └── requirements-test.txt                # 独立测试依赖
-├── scripts/
-│   ├── run_module1_tests.py                 # 跨平台测试启动器
-│   ├── run_module1_tests.sh                 # macOS/Linux 入口
-│   └── run_module1_tests.bat                # Windows 入口
-└── docs/module1/
-    └── LLMGal_backend_34_test_cases.md       # 34 条测试用例清单
+```powershell
+backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-volcengine.txt
 ```
 
-真正执行 34 条测试用例的代码集中在 `backend/tests/`：
+## 测试运行指南
 
-- [`backend/tests/test_websocket_cases.py`](backend/tests/test_websocket_cases.py)：包含 14 条 WebSocket 消息、嵌套配置、断线和 ACK 协议测试。
-- [`backend/tests/test_service_and_state_cases.py`](backend/tests/test_service_and_state_cases.py)：包含 20 条文本、语音、图片、资源索引、异常和并发状态测试。
-- [`backend/tests/conftest.py`](backend/tests/conftest.py)：由 pytest 自动加载，为上述测试提供公共导入配置、第三方 SDK Stub 和真实网络阻断，不单独计算为测试用例。
+课程的两个模块是两套独立交付：
 
-测试函数名直接包含清单编号。例如，清单中的 `TC-WS-01` 对应 `test_tc_ws_01_valid_static_request_full_flow`，可以据此从用例清单定位到具体代码。
+| 范围 | 测试入口 | 数量/基线 | API Key | 是否先启动服务 |
+| --- | --- | ---: | --- | --- |
+| 模块一：传统测试基础实践 | `scripts/run_module1_tests.*` | 34 passed | 不需要 | 不需要 |
+| 扩展后端回归测试 | `backend/tests/` | 124 passed | 不需要 | 不需要 |
+| 模块二：AI 融合实践（测 AI） | `backend/tests_ai/run_ai_tests.py` | 52 个 AI 用例 | 离线自检不需要；真实测试需要 | 不需要 |
+| 前端单元/组件测试 | Vitest | 23 passed | 不需要 | 不需要 |
+| WebSocket 端到端测试 | `backend/test_websocket.py` | 1 条真实链路 | 需要 | 需要 |
 
-#### 一键启动（模块一）
+上述基线于 Python 3.11.15、Node.js 22.13.1 下验证。参数化会使扩展后端测试的 pytest 收集数高于测试函数数。
 
-前置条件：安装 Python 3.9+；首次运行需能够访问 Python 包源安装依赖。**不需要启动后端、不需要 API Key，也不会调用真实 LLM/TTS 服务。**
+### 模块一：34 条传统测试
 
-在 `LLMGal` 仓库根目录按平台执行一条命令：
+模块一对应课程“测试基础实践”，只统计以下两份测试文件：
 
-| 平台 | 启动命令 |
-| --- | --- |
-| macOS / Linux | `./scripts/run_module1_tests.sh` |
-| Windows PowerShell / CMD | `scripts\run_module1_tests.bat` |
-| 所有平台（推荐的通用入口） | `python scripts/run_module1_tests.py` |
+- `backend/tests/test_websocket_cases.py`：14 条 WebSocket、配置、断线和 ACK 测试；
+- `backend/tests/test_service_and_state_cases.py`：20 条文本、语音、图片、资源状态和并发测试。
 
-启动器会自动创建或复用 `.venv-module1`、安装/更新测试依赖、执行 `backend/tests/` 的 34 条用例，并生成日志与 JUnit 结果。正常基线为：
+一键运行会自动创建独立的 `.venv-module1`、安装测试依赖、阻断真实网络调用，并输出覆盖率、日志和 JUnit 报告。
 
-```text
-32 passed, 2 xfailed
-```
-
-常用命令：
+macOS / Linux：
 
 ```bash
-# 显示每条用例名称
-python scripts/run_module1_tests.py -v
-
-# 指定 Python 解释器
-python scripts/run_module1_tests.py --python python3.12
-
-# Python 版本切换、环境损坏或依赖异常时，强制重建测试虚拟环境
-python scripts/run_module1_tests.py --recreate-venv
+./scripts/run_module1_tests.sh
 ```
 
-也可在 macOS/Linux 上通过环境变量指定解释器：
+Windows PowerShell / CMD：
+
+```powershell
+scripts\run_module1_tests.bat
+```
+
+通用 Python 入口：
 
 ```bash
-LLMGAL_TEST_PYTHON=/path/to/python3.12 ./scripts/run_module1_tests.sh
+python3 scripts/run_module1_tests.py --python python3.11
 ```
 
-如果 `.venv-module1` 的 Python 主次版本与当前启动器不同，启动器会自动重建它，避免复用错误解释器。
-
-34 个测试函数与 [`docs/module1/LLMGal_backend_34_test_cases.md`](docs/module1/LLMGal_backend_34_test_cases.md) 中的用例编号一一对应，覆盖配置映射、情绪解析、资源索引边界、静态与实时图像分支、文本提示词、语音保存、HTTP 请求结构、健康检查及 WebSocket 错误协议。文本模型、语音和图像相关依赖均使用固定 Mock/Stub；测试夹具会阻断遗漏的真实 HTTP 与 WebSocket 调用，因此不需要 API Key，不会调用真实大模型或产生第三方服务费用。
-
-当前基线运行结果为 `34 passed`，0 条失败、0 条预期失败。历史上 `TC-TTS-04`（非法 Base64 会产生零字节音频）与 `TC-EX-02`（非数字索引在清单预期的处理阶段之前即匹配失败）曾以 `xfail(strict=True)` 保留缺陷证据，这两处缺陷已在源码中修复，对应标记已同步移除。该标记的语义是：缺陷一旦被修复，用例转为 XPASS 并使脚本失败，提醒更新缺陷验证结果。
-
-另有 8 条用例原先以「断言缺陷行为」的方式通过——`TC-WS-08`、`TC-CFG-01/02/06`、`TC-ACK-03`、`TC-CON-01`、`TC-RES-03`、`TC-EX-01`。这类用例的通过本身就代表缺陷仍在，本质上与 `xfail` 等价，只是没有显式标记。这 8 条对应的缺陷已在源码中修复，断言已同步翻转为对正确行为的期望。**注意：这类探针在缺陷被修复后必然转为失败，必须与源码改动成对处理，否则会被误判为回归。**
-
-执行结果保存在：
-
-- `artifacts/test-results/pytest-output.txt`：终端执行日志与覆盖率摘要
-- `artifacts/test-results/module1-junit.xml`：可供持续集成或报告工具读取的 JUnit 结果
-
-### 前端测试
+常用参数会继续透传给 pytest：
 
 ```bash
-cd frontend
-npm ci
-npm test -- --run
+# 展示每条用例名称
+python3 scripts/run_module1_tests.py --python python3.11 -v
+
+# 仅运行 WebSocket 编号相关用例
+python3 scripts/run_module1_tests.py --python python3.11 -k tc_ws
+
+# 环境损坏或 Python 版本变化后重建
+python3 scripts/run_module1_tests.py --python python3.11 --recreate-venv
 ```
 
-生成覆盖率报告：
+输出文件：
 
-```bash
-npm run test:coverage -- --run
-```
+- `artifacts/test-results/pytest-output.txt`
+- `artifacts/test-results/module1-junit.xml`
 
-### 后端 WebSocket 端到端测试
+用例清单见 `docs/module1/LLMGal_backend_34_test_cases.md`。
 
-先按“快速开始”启动后端，再在另一个已激活虚拟环境的终端执行：
+### 扩展后端回归测试
+
+模块一脚本运行后，可复用 `.venv-module1` 执行 `backend/tests/` 下的全部传统回归测试。这些新增测试用于开发回归，不计入模块一的 34 条交付统计。
+
+macOS / Linux：
 
 ```bash
 cd backend
-python -m pytest test_websocket.py -v
+../.venv-module1/bin/python -m pytest tests -v
 ```
 
-该测试会调用真实的文本、语音和图像服务，需要有效测试凭据和网络连接，可能产生调用费用。它不属于隔离的单元测试。
+Windows：
 
-前端测试和原有后端端到端测试可在后端已启动时依次执行：
+```powershell
+cd backend
+..\.venv-module1\Scripts\python.exe -m pytest tests -v
+```
+
+### 模块二：AI 测试
+
+模块二采用“方案 1：测 AI”，`backend/tests_ai/run_ai_tests.py` 定义了 52 个 AI 用例，覆盖鲁棒性、安全性、公平性、情绪协议、多模态耦合和角色一致性。TTS 与图片调用在该脚本中使用测试替身隔离；不带 `--mock-llm` 时仍会调用真实文本模型并可能产生费用。
+
+先运行不调用真实模型的脚手架自检：
 
 ```bash
-(cd frontend && npm test -- --run) && (cd backend && python -m pytest test_websocket.py -v)
+backend/.venv/bin/python backend/tests_ai/run_ai_tests.py --mock-llm --mode screen
 ```
 
-其他质量检查：
+Windows：
+
+```powershell
+backend\.venv\Scripts\python.exe backend\tests_ai\run_ai_tests.py --mock-llm --mode screen
+```
+
+配置好文本模型密钥后，运行每个变体一次的真实筛查：
 
 ```bash
-cd frontend
-npm run lint
-npm run build
+backend/.venv/bin/python backend/tests_ai/run_ai_tests.py --mode screen
 ```
 
-## 当前状态与推荐被测范围
+运行完整重复批次或指定用例：
 
-当前包含 34 个与模块一用例清单对应、使用固定 Mock/Stub 的后端隔离单元测试，一个前端基础冒烟测试，以及一个依赖真实外部服务的后端 WebSocket 端到端测试。隔离单元测试可一键执行；端到端测试仍需预先启动服务并配置外部凭据。现有代码仍有 TypeScript 构建、Lint、平台依赖、相对路径和凭据管理问题，需要逐步定位、记录并修复。
+```bash
+# 完整批次：会进行较多真实 LLM 调用
+backend/.venv/bin/python backend/tests_ai/run_ai_tests.py
 
-建议优先覆盖：
+# 只运行指定用例；--case 可重复
+backend/.venv/bin/python backend/tests_ai/run_ai_tests.py \
+  --case AI-R-01 --case AI-S-01
+```
 
-- WebSocket 消息格式、异常输入、断线重连和 ACK 超时
-- 角色提示词读取、缺失文件和非法角色名
-- 七类情绪的提取、默认回退和图片映射
-- 图片与音频索引在 `0` 到 `9` 之间的轮换边界
-- 实时图像生成失败后的静态资源回退
-- 第三方接口超时、限流、无效凭据和异常响应
-- 前端设置持久化、消息编辑、停止生成和状态同步
+结果保存在 `backend/tests_ai/results/` 的 JSONL 和 CSV 文件中。`REVIEW` 表示需要人工复核，不等同于失败；`INFRA_ERROR` 表示网络、鉴权、超时或限流问题，不计为 AI 行为缺陷。
+
+### 前端测试与质量检查
+
+```bash
+# 单次运行全部 Vitest 测试
+npm --prefix frontend test -- --run
+
+# 生成文本、HTML 和 LCOV 覆盖率报告
+npm --prefix frontend run test:coverage -- --run
+
+# TypeScript 检查并构建生产包
+npm --prefix frontend run build
+
+# ESLint
+npm --prefix frontend run lint
+```
+
+当前生产构建可通过；ESLint 仍会在 `chatAudio.test.ts` 报 2 条已有错误。Node.js 25 下测试会出现 `localStorage.getItem is not a function`，请切换到 Node.js 22 LTS。
+
+### 真实 WebSocket 端到端测试
+
+先配置有效的文本、TTS、图像服务凭据并启动后端，再执行：
+
+```bash
+cd backend
+.venv/bin/python -m pytest test_websocket.py -v
+```
+
+Windows：
+
+```powershell
+cd backend
+.venv\Scripts\python.exe -m pytest test_websocket.py -v
+```
+
+该测试会连接 `ws://localhost:8000/ws/chat`，真实调用第三方服务并写入语音/图片缓存，可能产生费用。启用 `WS_AUTH_TOKEN` 时，现有测试客户端没有携带令牌，会被后端拒绝。普通单元测试和课程演示优先使用前述隔离测试。
 
 ## 已知限制
 
-- 第三方服务配置尚未统一迁移到环境变量。
-- 实时图像生成、部分模型切换和音色配置仍不完整。
-- 原有的 `backend/test_websocket.py` 仍依赖真实外部服务；课程单元测试已通过 Mock/Stub 隔离。
-- 当前前端 `build` 与 `lint` 存在待修复问题。
-- 仓库仍包含部分历史开发期生成文件；根目录 `.gitignore` 已覆盖新的测试缓存和结果文件。
+- 项目仍是开发原型，第三方模型响应、限流和可用性会影响正式版体验。
+- Node.js 25 与当前前端测试依赖不兼容；推荐 Node.js 22 LTS。
+- ESLint 当前有 2 条测试代码错误；生产构建可完成，但存在较大的 bundle 分块警告。
+- 真实端到端测试依赖外部凭据和网络，结果不具备完全确定性且可能产生调用费用。
+- 前端设置面板中的 API Key 不能替代后端 `backend/.env` 配置。
 
 ## 项目来源与许可
 
