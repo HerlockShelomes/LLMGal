@@ -35,6 +35,11 @@ Emotion_Prompt = """
 # Connect 侧优先取这里的真实值，取不到再退回按字数估算。
 LAST_USAGE: dict | None = None
 
+# 最近一次真实调用返回的「思考内容」（推理模型如 DeepSeek-R1 / 智谱推理档才有）。
+# 前端经 WebSocket 流式展示思考过程时，主要靠 on_reasoning 回调实时推送；
+# 这里额外落一份全局变量，便于后端日志与调试回溯。无思考内容时为 None。
+LAST_REASONING: str | None = None
+
 
 def get_role_prompt(role_name: str) -> str:
     """读取角色人设并追加情绪输出约束。
@@ -115,19 +120,23 @@ def build_client() -> OpenAI:
     )
 
 
-def get_llm_response(model, role, prompt, history=None):
+def get_llm_response(model, role, prompt, history=None, on_reasoning=None):
     """调用文本大模型生成回复。
 
     :param model: 模型名称；留空或 None 时使用 config.TEXT_MODEL
     :param role: 角色名称，用于读取人设
     :param prompt: 用户消息（字符串或 {role, content} 对象）
     :param history: 可选，多轮历史消息列表
+    :param on_reasoning: 可选回调，每次收到思考内容增量片段时调用（流式展示用）。
+                         非推理模型不会触发；回调异常不影响主流程。
     :return: 模型生成的文本
     """
-    global LAST_USAGE
+    global LAST_USAGE, LAST_REASONING
     LAST_USAGE = None
+    LAST_REASONING = None
 
     answer_content = ""
+    reasoning_content = ""
     role_pro = get_role_prompt(role)
 
     # N02：人设必须用 system 承载。
@@ -164,6 +173,67 @@ def get_llm_response(model, role, prompt, history=None):
                     "total_tokens": getattr(usage, "total_tokens", 0) or 0,
                 }
             except Exception:  # pragma: no cover - usage 结构异常不应中断生成
+                LAST_USAGE = None
+
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        content = getattr(delta, "content", None) if delta is not None else None
+        if content:
+            answer_content += content
+
+        # 推理模型的思考过程随 delta.reasoning_content 流式下发；非推理模型该字段恒为空，
+        # 不会进入此分支，也不会影响正式回复的拼接。
+        reasoning = getattr(delta, "reasoning_content", None) if delta is not None else None
+        if reasoning:
+            reasoning_content += reasoning
+            if on_reasoning is not None:
+                try:
+                    on_reasoning(reasoning)
+                except Exception:  # pragma: no cover - 回调异常不应中断生成
+                    logging.exception("on_reasoning 回调异常（已忽略，不影响主回复）")
+
+    LAST_REASONING = reasoning_content or None
+    return answer_content
+
+
+def get_llm_raw_response(system_prompt: str, user_prompt: str, model=None) -> str:
+    """不带角色人设的原始调用。
+
+    get_llm_response 会去读 frontend/src/assets/roles/{role}.txt 当人设，
+    而「创建新角色」流程里这个角色还不存在（文件尚未落盘），
+    扩写形象描述、生成打招呼台词等场景必须能独立发一次请求。
+    """
+    global LAST_USAGE
+    LAST_USAGE = None
+
+    client = build_client()
+    request_kwargs = {
+        "model": config.resolve_text_model(model),
+        "stream": True,
+        "temperature": config.TEXT_TEMPERATURE,
+        "max_tokens": config.TEXT_MAX_TOKENS,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    if config.TEXT_REASONING_EFFORT:
+        request_kwargs["reasoning_effort"] = config.TEXT_REASONING_EFFORT
+
+    answer_content = ""
+    completion = client.chat.completions.create(**request_kwargs)
+    for chunk in completion:
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            try:
+                LAST_USAGE = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                }
+            except Exception:  # pragma: no cover
                 LAST_USAGE = None
 
         choices = getattr(chunk, "choices", None)

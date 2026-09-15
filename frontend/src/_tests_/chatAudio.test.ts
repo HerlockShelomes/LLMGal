@@ -18,7 +18,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  *   - 收到响应后 src 一定被赋值、load() 一定被调用（不 load 就永远 readyState=0）；
  *   - readyState < 2 时绝不 play()，到 2 之后才 play()，且只 play 一次；
  *   - 连续两轮：第二轮先 pause，页面上只有一个 audio 元素；
- *   - **过期请求迟到落定时不得调用 pause()**（第 3 条坑的回归测试）。
+ *   - **过期请求迟到落定时不得调用 pause()**（第 3 条坑的回归测试）；
+ *   - Mock 报文取 voice/_mock/{角色}/，正式版报文取 voice/{角色}/，两者不互相回退。
  */
 
 // jsdom 不实现媒体播放，打桩并记录调用
@@ -80,7 +81,7 @@ vi.mock('../utils/WebSocketManager.ts', () => {
   return { WebSocketManager: FakeWebSocketManager };
 });
 
-const buildResponse = (index: string) => ({
+const buildResponse = (index: string, mode?: 'prod' | 'mock') => ({
   type: 'assistant_response',
   message_id: 'msg-1',
   status: 'success',
@@ -90,6 +91,8 @@ const buildResponse = (index: string) => ({
     index,
     metrics: { time_cost: 1.2, tokens_used: 30 },
     imageUrl: '',
+    // 老后端不带 mode；不传时前端必须按正式版处理（与改动前行为一致）
+    ...(mode ? { mode } : {}),
   },
 });
 
@@ -220,4 +223,56 @@ describe('ChatView 语音播放链路', () => {
     // 过期请求也不该再发起新的播放
     expect(playSpy).toHaveBeenCalledTimes(2);
   }, CASE_TIMEOUT);
+});
+
+/**
+ * 音频目录按「这条消息自带的模式」分流。
+ *
+ * 背景：Mock 版曾经把测试音频覆盖写到正式版槽位 voice/{角色}/，
+ * 切回正式版后引用同一 index 的历史消息会播到那份测试音频。现在 mock 写
+ * voice/_mock/{角色}/，前端按 payload.mode 选目录 —— 而不是看界面上的当前模式，
+ * 因为「响应在途时切模式」「回看历史消息」两种情况都会让两者对不上。
+ */
+describe('音频目录按消息自带的模式选择', () => {
+  it('mode=mock 走 _mock 目录，且不把正式版目录当候选', async () => {
+    const { getAudioUrls } = await import('../stores/settings.ts');
+
+    const mockUrls = getAudioUrls('Wendy', '0', 'mock');
+    expect(mockUrls.length).toBeGreaterThan(0);
+    expect(mockUrls.some((u) => u.includes('/voice/_mock/Wendy/'))).toBe(true);
+    // 正式版目录（真实对话音频）绝不能进候选，否则 mock 出问题时会「悄悄播真语音」
+    expect(mockUrls.some((u) => /\/voice\/Wendy\//.test(u))).toBe(false);
+
+    const prodUrls = getAudioUrls('Wendy', '0', 'prod');
+    expect(prodUrls.some((u) => /\/voice\/Wendy\//.test(u))).toBe(true);
+    expect(prodUrls.some((u) => u.includes('/voice/_mock/'))).toBe(false);
+  });
+
+  it('mock 报文让 <audio> 取到 _mock 目录', async () => {
+    const wrapper = await mountChatView();
+    await flushPromises();
+    const audioEl = wrapper.find('audio').element as HTMLAudioElement;
+
+    fakeReadyState = 2;
+    managerRef.current.emit('message', buildResponse('0', 'mock'));
+    await settle();
+
+    const src = audioEl.getAttribute('src') ?? '';
+    expect(src).toContain('/voice/_mock/');
+    expect(src).toContain('_0_Stream');
+  });
+
+  it('不带 mode 的老报文仍按正式版目录取音频', async () => {
+    const wrapper = await mountChatView();
+    await flushPromises();
+    const audioEl = wrapper.find('audio').element as HTMLAudioElement;
+
+    fakeReadyState = 2;
+    managerRef.current.emit('message', buildResponse('5'));
+    await settle();
+
+    const src = audioEl.getAttribute('src') ?? '';
+    expect(src).toContain('_5_Stream');
+    expect(src).not.toContain('/voice/_mock/');
+  });
 });

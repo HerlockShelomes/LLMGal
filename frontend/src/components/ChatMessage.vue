@@ -152,19 +152,19 @@ const handleCopyAll = async () => {
     </div>
     <!-- 消息内容，根据加载状态显示不同内容 -->
     <div class="message-content">
-      <!-- 显示模式 -->
-      <div class="message-text" v-if="!loading && !isEditing">
-        <!-- 思考内容 -->
+      <!-- 显示模式：思考内容与正式回复都在这里渲染；编辑模式单独处理 -->
+      <div class="message-text" v-if="!isEditing">
+        <!-- 思考内容（灰色，非正式回复）：流式展示，正式回复到达后由父组件清空 -->
         <div class="reasoning-content" v-if="message.reasoning_content">
             <div class="reasoning-header">
                 <el-icon><Lightning /></el-icon>
                 <span>思考过程</span>
             </div>
             <!-- 使用 v-html 渲染 Markdown 内容 -->
-            <div class="markdown-body" v-html="renderMarkdown(message.reasoning_content)"></div>
+            <div class="markdown-body reasoning-body" v-html="renderMarkdown(message.reasoning_content)"></div>
         </div>
-        <!-- 回答内容 -->
-        <div class="markdown-body" v-html="renderedContent" ref="markdownBody" @click="handleCodeBlockClick"></div>
+        <!-- 回答内容：仅在有正文时渲染 -->
+        <div class="markdown-body answer-body" v-if="message.content" v-html="renderedContent" ref="markdownBody" @click="handleCodeBlockClick"></div>
       </div>
 
       <!-- 编辑模式 -->
@@ -184,7 +184,8 @@ const handleCopyAll = async () => {
         </div>
       </div>
 
-      <div class="message-loading" v-if="loading">
+      <!-- 加载态：仅在「正在生成且无思考内容」时显示，避免与灰色思考块重复提示 -->
+      <div class="message-loading" v-if="loading && !message.reasoning_content">
         <el-icon class="is-loading"><Loading /></el-icon>
         正在思考...
       </div>
@@ -244,6 +245,13 @@ const handleCopyAll = async () => {
     //翻转实现用户布局在右侧
     .message-content {
       align-items: flex-end;
+    }
+  }
+
+  // 助手消息：左对齐且宽度贴合内容（flex-start 关闭交叉轴拉伸，气泡才不会撑满整行）
+  &.message-assistant {
+    .message-content {
+      align-items: flex-start;
     }
   }
 
@@ -433,7 +441,11 @@ const handleCopyAll = async () => {
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
-  max-width: 80%;
+  // 气泡宽度贴合文字内容（fit-content），最长不超过聊天区 80% 或 760px，
+  // 避免长文把气泡撑满整行、短句却留出大片空白导致「对话框不贴合文字」。
+  width: fit-content;
+  max-width: min(80%, 760px);
+  min-width: 0;
 }
 
 .message-text {
@@ -442,6 +454,12 @@ const handleCopyAll = async () => {
   border-radius: var(--border-radius);
   box-shadow: var(--box-shadow);
   white-space: pre-wrap;
+  // 气泡本体也贴合内容宽度，并对超长单词/代码做换行，防止文本溢出气泡。
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 
   // 如果存在思考内容，调整回答内容的样式
   .reasoning-content + .markdown-body {

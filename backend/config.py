@@ -12,6 +12,7 @@ Text.py / Voice.py / Image.py 里，既泄露又无法切换厂商。这里统�
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -241,6 +242,11 @@ QWEN_VOICE_CATALOG = {
     "Jennifer": ("詹妮弗", "女", "电影质感的美语女声"),
     "Ryan": ("甜茶", "男", "节奏拉满、戏感炸裂"),
     "Aiden": ("艾登", "男", "精通厨艺的美语大男孩"),
+    # 2026-09-14 补全：对照官方《Qwen-TTS 音色列表》，qwen3-tts-flash 实际支持 27 个音色，
+    # 上面原有 24 个全部有效，以下 3 个此前漏收（Arthur / Seren / Pip）。
+    "Arthur": ("徐大爷", "男", "质朴沙哑的乡土老者，满村奇闻异事"),
+    "Seren": ("小婉", "女", "温和舒缓的助眠女声"),
+    "Pip": ("顽屁小孩", "男", "调皮捣蛋、充满童真的小男孩"),
 }
 
 # 默认角色音色：按人设性格配对，四个角色彼此不同
@@ -281,12 +287,51 @@ def _load_role_voices(env_key: str, defaults: dict) -> dict:
 ROLE_VOICES = _load_role_voices("ROLE_VOICE_MAP", _DEFAULT_ROLE_VOICES)
 ROLE_VOICES_VOLC = _load_role_voices("ROLE_VOICE_MAP_VOLC", _DEFAULT_ROLE_VOICES_VOLC)
 
+# 内置角色（仓库自带、不可删除）。由静态默认表 _DEFAULT_ROLE_VOICES 派生，
+# 单一真相源 —— .env 的 ROLE_VOICE_MAP 只是给角色加音色映射，不代表新增内置角色，
+# 因此不参与这里的判定（那些角色没有配套素材，删也删不出东西）。
+BUILTIN_ROLES = tuple(_DEFAULT_ROLE_VOICES.keys())
+
+# 前端「创建新角色」产生的角色→音色映射。
+# 内置默认与 .env 都是**静态**的，新角色没法往里塞，所以单独落一个 JSON：
+# 由 Create_New_Role 写入，运行时按 mtime 增量读取（文件不存在时返回空，行为不变）。
+CUSTOM_ROLE_VOICES_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "custom_role_voices.json"
+)
+_custom_role_voices_cache: dict = {"mtime": -1.0, "data": {}}
+
+
+def _load_custom_role_voices() -> dict:
+    try:
+        mtime = os.path.getmtime(CUSTOM_ROLE_VOICES_PATH)
+    except OSError:
+        return {}
+    if mtime == _custom_role_voices_cache["mtime"]:
+        return _custom_role_voices_cache["data"]
+    try:
+        with open(CUSTOM_ROLE_VOICES_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    _custom_role_voices_cache.update({"mtime": mtime, "data": data})
+    return data
+
 
 def resolve_role_voice(role: str, fallback: str = "") -> str:
-    """按角色取音色；角色未登记时回退到调用方给的值。"""
+    """按角色取音色；角色未登记时回退到调用方给的值。
+
+    查找顺序：内置/.env 的 ROLE_VOICES -> 前端创建的自定义角色映射 -> fallback。
+    """
     if not role:
         return fallback
-    return ROLE_VOICES.get(role, fallback)
+    if role in ROLE_VOICES:
+        return ROLE_VOICES[role]
+    custom = _load_custom_role_voices().get(role)
+    if custom:
+        return custom
+    return fallback
 
 
 def resolve_role_voice_volc(role: str, fallback: str = "") -> str:
@@ -307,6 +352,23 @@ IMAGE_PROVIDER = _get("IMAGE_PROVIDER", "zhipu").lower()
 IMAGE_ZHIPU_BASE_URL = _get("IMAGE_ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 IMAGE_ZHIPU_MODEL = _get("IMAGE_ZHIPU_MODEL", "cogview-3-flash")
 IMAGE_ZHIPU_SIZE = _get("IMAGE_ZHIPU_SIZE", "1024x1024")
+# 新角色立绘：要求「正方形 + 至少高清」，与对话时的实时图尺寸分开配置，
+# 免得为了省钱把对话图调小，结果立绘也跟着变糊。
+IMAGE_ROLE_SIZE = _get("IMAGE_ROLE_SIZE", "1024x1024")
+
+# 默认画风：二次元动漫原画。这是**项目底层默认值**，所有出图路径（新角色立绘、
+# 7 张情绪扩展图、对话实时图）都必须经 Image.build_style_head() 取画风，
+# 禁止各处手写 —— 之前 emotional_bro 自己写了一段 SD 标签脚手架，出图风格就和
+# 立绘对不上。要整体换画风，改这里（或 .env 的 IMAGE_STYLE_PROMPT）即可。
+#
+# 刻意不含 photo / realistic / 3D render / studio lighting 等摄影·写实词汇：
+# 指令式文生图模型（CogView / Seedream）会被这类词强烈拉向写实人像，实测见
+# Image.ANIME_STYLE_HEAD 上方注释。
+IMAGE_STYLE_PROMPT = _get(
+    "IMAGE_STYLE_PROMPT",
+    "2D anime key visual illustration in Japanese anime style, official anime "
+    "artwork, cel shading, clean line art, flat colors, vibrant, high quality, detailed",
+)
 
 IMAGE_VOLC_ACCESS_KEY = _get("IMAGE_VOLC_ACCESS_KEY", "")
 IMAGE_VOLC_SECRET_KEY = _get("IMAGE_VOLC_SECRET_KEY", "")
@@ -332,8 +394,91 @@ PORT = _get_int("PORT", 8000)
 DEV_RELOAD = _get_bool("DEV_RELOAD", False)
 
 
+# --------------------------------------------------------------------------
+# 运行时模式：Mock（AI 旁路）/ 正式版（prod）
+# --------------------------------------------------------------------------
+# Mock 版只验证「前端展示 + 后端处理 + 前后端连接」这三件事，AI 一律不下场：
+#   文本回复 -> 固定的系统状态日志（回显输入 + 各链路状态）
+#   语音     -> 固定复用本地已有的测试样本
+#   图像     -> 固定返回 neutral（情绪图里的中性那张）
+# 开关由前端设置页顶部的按钮经 REST(/api/system/mode) 切换，状态落盘在
+# backend/runtime_mode.json —— uvicorn --reload 会重启进程，只放内存里切完就丢。
+#
+# 注意：文件不存在时即「正式版」，所以开箱默认就是完整功能，不会静默降级。
+# 该文件属于运行时状态，不应提交（见根 .gitignore）。
+MODE_MOCK = "mock"
+MODE_PROD = "prod"
+_VALID_MODES = (MODE_MOCK, MODE_PROD)
+
+MODE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_mode.json")
+
+# .env 的 APP_MODE 只决定「没有任何落盘记录时」的初值，缺省 prod。
+_initial_mode = _get("APP_MODE", MODE_PROD).lower()
+if _initial_mode not in _VALID_MODES:
+    _initial_mode = MODE_PROD
+
+
+def _read_mode_file() -> str:
+    """读落盘的模式；文件缺失/损坏/取值非法一律返回空串（= 用默认值）。"""
+    try:
+        with open(MODE_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    mode = str(data.get("mode", "")).strip().lower()
+    return mode if mode in _VALID_MODES else ""
+
+
+def get_mode() -> str:
+    """当前运行时模式（'mock' / 'prod'）。
+
+    每次调用都读一次盘，**不做进程内缓存**。文件只有几十字节，这点开销相比
+    一次 LLM 调用可以忽略；而缓存会让下面三种情况「界面与后端各说各话」：
+      · 多 worker（`uvicorn --workers N`）——切换只更新了接请求的那个进程；
+      · 手工编辑 runtime_mode.json（排障时很常见）；
+      · 另一个进程/工具写入。
+    落盘用的是「临时文件 + os.replace」，读到的必然是完整的旧值或新值。
+    """
+    return _read_mode_file() or _initial_mode
+
+
+def is_mock() -> bool:
+    """是否处于 Mock 版（AI 旁路）。对话链路在每个请求上都会问一次。"""
+    return get_mode() == MODE_MOCK
+
+
+def set_mode(mode: str) -> str:
+    """切换运行时模式并落盘。非法取值抛 ValueError，由调用方回 400。"""
+    value = (mode or "").strip().lower()
+    if value not in _VALID_MODES:
+        raise ValueError(f"不支持的模式 {mode!r}，只能是 {_VALID_MODES}")
+    # 原子落盘：先写临时文件再 replace。reload 期间有并发读，
+    # 直接覆写会读到「写了一半」的 JSON，被当成损坏文件而回落到默认模式。
+    temp_path = f"{MODE_PATH}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as file:
+            json.dump({"mode": value}, file, ensure_ascii=False, indent=2)
+        os.replace(temp_path, MODE_PATH)
+    except OSError as error:
+        # 落盘失败就必须让调用方知道：get_mode() 不再有内存态兜底，
+        # 静默返回「切换成功」而实际没写进去，等于骗用户。
+        logging.exception("运行时模式落盘失败")
+        raise RuntimeError(f"模式落盘失败：{error}") from error
+    return value
+
+
+def mode_label() -> str:
+    """给人看的模式名称，用于日志、启动自检与 REST 响应。"""
+    return "Mock 版（AI 已旁路）" if is_mock() else "正式版（AI 已接入）"
+
+
 def missing_credentials() -> list[str]:
     """返回尚未填写、会导致功能不可用的配置项，供启动自检使用。"""
+    if is_mock():
+        # Mock 版一个厂商接口都不调，缺密钥不影响可用性，别在这里误报一次告警。
+        return []
     missing = []
     if not TEXT_API_KEY:
         missing.append(f"TEXT_API_KEY（{TEXT_PROVIDER} 文本模型的密钥）")
@@ -353,6 +498,8 @@ def missing_credentials() -> list[str]:
 def describe() -> str:
     """启动自检信息（不打印密钥本身）。"""
     lines = [
+        f"运行模式 : {mode_label()}"
+        + (f"  [开关文件 {MODE_PATH}]" if os.path.exists(MODE_PATH) else "  [默认值，未切换过]"),
         f"文本模型 : provider={TEXT_PROVIDER} model={TEXT_MODEL} base_url={TEXT_BASE_URL}",
         f"语音合成 : provider={TTS_PROVIDER}"
         + (f" model={TTS_QWEN_MODEL} voice={TTS_QWEN_DEFAULT_VOICE}" if TTS_PROVIDER == "qwen" else ""),

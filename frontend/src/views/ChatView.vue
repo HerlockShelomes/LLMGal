@@ -8,6 +8,8 @@ import {
   useSettingsStore,
   getAudioUrl,
   getAudioUrls,
+  APP_MODE_LABELS,
+  type AppMode,
 } from '../stores/settings.ts'
 import {messageHandler} from '../utils/messageHandler.ts'
 import ChatMessage from '../components/ChatMessage.vue'
@@ -15,8 +17,12 @@ import ChatInput from '../components/ChatInput.vue'
 import SettingsPanel from '../components/SettingsPanel.vue'
 import SideBar from '../components/SideBar.vue'
 import SearchBar from '../components/SearchBar.vue'
-import {ElMessage} from 'element-plus'
+import {ElMessage, ElMessageBox} from 'element-plus'
 import {WebSocketManager} from '../utils/WebSocketManager.ts'
+// 角色创建进度：页面刷新后要把 localStorage 里残留的「创建中」角色重新盯上
+import {reconcileCreatingRoles, reconcileCustomRoles} from '../utils/roleCreation.ts'
+// 运行时模式（Mock / 正式版）：刷新后要和后端的真实状态对账
+import {syncAppModeFromBackend} from '../utils/appMode.ts'
 // 全局单一发声通道：保证对话语音与设置面板的试听音不会同时响
 import {claimPlayback, releasePlayback, stopAllPlayback, isPlaybackOwner} from '../utils/audioBus.ts'
 import {
@@ -35,6 +41,12 @@ const chatStore = useChatStore()
 // 计算属性，获取消息列表和加载状态
 const currentChatMessages = computed(() => chatStore.currentMessages)
 const isLoading = computed(() => chatStore.isLoading)
+// 当前会话最后一条消息：用于把「正在生成」的 loading 状态精确挂到助手占位消息上，
+// 避免把历史消息也误标成加载中（原先 :loading 根本没传，逐条"正在思考…"是死代码）。
+const lastMessage = computed(() => {
+  const msgs = chatStore.currentMessages
+  return msgs.length ? msgs[msgs.length - 1] : null
+})
 // 设置面板显示状态
 const showSettings = ref(false)
 // 消息容器引用，用于滚动到底部
@@ -45,10 +57,26 @@ const RSC = useRSCstore()
 const ind = ref<string>('happy')
 const indx = ref<string>('0')
 const imgurl = ref<string>('')
+
+// 产出「最近一条回复」的运行时模式，由后端随响应下发（payload.mode）。
+// 音频目录要用它来选，**不能用 settings.appMode**：后者只是界面上的当前模式，
+// 响应在途时切模式、或将来支持回放历史消息时，它和那条消息已经不是一套模式了。
+const lastResponseMode = ref<AppMode>('prod')
 const settings = useSettingsStore();
 
+// 运行时模式镜像。Mock 版下 AI 不接入回复，界面必须让用户一眼看出来，
+// 否则「回复千篇一律」会被误判成模型坏了。
+// 判定与切换都在后端，这里只负责显示。
+const isMockMode = computed(() => settings.appMode === 'mock')
+const mockBadgeHint = computed(
+  () => `当前为${APP_MODE_LABELS.mock}：回复固定为系统状态回执，音频与图像固定为测试内容。` +
+        '在设置页顶部可切换回正式版。'
+)
+
+// 初始值只是个占位：第一条响应到达之前不会播放任何音频，
+// 真正播放时用的是 lastResponseMode（见 handleServerMessage）。
 const currentAudioUrl = ref<string>(
-    getAudioUrl(settings.RoleConfig.roleName, indx.value)
+    getAudioUrl(settings.RoleConfig.roleName, indx.value, settings.appMode)
 )
 
 
@@ -171,6 +199,14 @@ const sendViaWebSocket = (content: string, history: HistoryMessage[] = []) => {
 
 // 统一的入队逻辑：写入用户消息 + 助手占位消息，再通过 WebSocket 发出
 const enqueueMessage = (content: string, history: HistoryMessage[] = []) => {
+  // 新角色的 7 张情绪图 + 语音还在后台生成，此时调用会缺资源，直接拦下来。
+  if (settings.creatingRoles.includes(settings.RoleConfig.roleName)) {
+    ElMessageBox.alert('角色未创建完毕', '提示', {
+      confirmButtonText: '确定',
+      type: 'warning',
+    })
+    return
+  }
   chatStore.addMessage(messageHandler.formatMessage('user', content))
   chatStore.addMessage(messageHandler.formatMessage('assistant', ''))
   chatStore.isLoading = true
@@ -572,11 +608,18 @@ const handleServerMessage = (data: AnyServerMessage) => {
     // 展示给用户的正文要剥掉开头的情绪括号（语音侧后端已处理，这里处理文本展示）
     chatStore.updateLastMessage(stripEmotionPrefix(resp), '');
 
+    // 本条回复是哪套模式产出的，决定音频在 voice/_mock/{角色}/ 还是 voice/{角色}/。
+    // 必须用消息自带的模式，不能用界面上的当前模式：切换发生在两次回复之间时，
+    // 用当前模式会把 mock 的消息指到正式版目录（反之亦然），听到的与文字对不上。
+    lastResponseMode.value = data.payload.mode === 'mock' ? 'mock' : 'prod';
+
     // 显式播放，不再依赖 currentAudioUrl 的 watch：
     // index 与上一轮相同时 watch 根本不会触发，新一轮的语音就永远播不出来。
     // 传候选列表而不是单一地址：dev 下优先磁盘上的最新 wav，
     // 该文件还没生成时自动回退到构建期快照里的历史素材。
-    const audioCandidates = getAudioUrls(settings.RoleConfig.roleName, RSC.index)
+    const audioCandidates = getAudioUrls(
+        settings.RoleConfig.roleName, RSC.index, lastResponseMode.value)
+    console.log(`[音频] 模式=${lastResponseMode.value} 首选=${audioCandidates[0] ?? '(无候选)'}`)
     currentAudioUrl.value = audioCandidates[0] ?? ''
     playAudio(audioCandidates)
 
@@ -651,6 +694,31 @@ const handleErrorEvent = (error: unknown) => {
     sender: "system",
     state: "Error",
   });
+  // 连接异常要反馈到前端，否则用户只在控制台看到报错、界面毫无提示。
+  // 重连进行中时只轻量提示，避免每条重连错误都弹窗刷屏。
+  if (reconnectTimes.value < MAX_RECONNECT_TIMES) {
+    ElMessage.warning({
+      message: 'WebSocket 连接异常，正在尝试重连…',
+      duration: 3000,
+      showClose: true,
+    })
+  }
+};
+
+// 报文 JSON 解析失败：后端发来的不是合法 JSON（多半是协议不匹配或连接被劫持）。
+// 原先只打控制台，用户完全无感；这里明确提示。
+const handleParseError = (error: unknown) => {
+  console.error('WebSocket 报文解析失败: ', error);
+  receives.value.push({
+    id: "Event Detected: Parse Error",
+    sender: "system",
+    state: "Parse Error",
+  });
+  ElMessage.error({
+    message: '收到无法解析的服务器消息，请刷新页面或检查前后端版本是否一致',
+    duration: 5000,
+    showClose: true,
+  });
 };
 
 // 后端判定 payload 非法（缺 role / modelText / realTimeRendering，或 text 是裸字符串）
@@ -683,13 +751,25 @@ const handleInvalidMessage = (data: unknown) => {
 
 // 监听器只注册一次：initWebSocket 每次重连都会被调用，
 // 若在内部注册，同一个处理器会被叠加多次，导致一条响应被处理多遍。
+// 流式进度：后端把模型思考内容增量经 stream_progress(reasoning) 推来，
+// 这里追加到正在生成的助手消息上，以灰色字体展示（非正式回复）。
+// 没有 reasoning 字段的普通进度帧继续打日志，不影响主流程。
+const handleProgress = (payload: { progress?: number; status?: string; reasoning?: string }) => {
+  if (payload && typeof payload.reasoning === 'string' && payload.reasoning) {
+    chatStore.appendReasoning(payload.reasoning)
+  } else {
+    console.log('stream', payload)
+  }
+}
+
 const handleConnectionEvents = () => {
   websocketManager.on('connected', handleConnected);
   websocketManager.on('disconnected', handleDisconnected);
   websocketManager.on('error', handleErrorEvent);
   websocketManager.on('message', handleServerMessage);
+  websocketManager.on('progress', handleProgress);
   websocketManager.on('invalid_message', handleInvalidMessage);
-  websocketManager.on('parse_error', handleErrorEvent);
+  websocketManager.on('parse_error', handleParseError);
 };
 
 handleConnectionEvents();
@@ -749,6 +829,25 @@ const handleSendbyWebSocket = (content: string) => {
 onMounted (() => {
   // 「组件被重建」的探针：Vite HMR / 整页刷新都会在这里留痕
   console.log('[音频] ChatView 挂载（每次重建都会打印）')
+  // 与后端对一次运行时模式：界面上显示的必须是后端的真实状态，
+  // 不能拿 localStorage 里的旧镜像糊弄（可能被另一个标签页或手工改过）。
+  syncAppModeFromBackend()
+  // 刷新后把还在创建中的角色重新挂上进度轮询，否则它们会永远卡在「创建中」
+  reconcileCreatingRoles((role, ok, error) => {
+    if (ok) {
+      ElMessage.success(`角色「${role}」创建完成，可以开始对话了`)
+    } else {
+      ElMessage.error(`角色「${role}」创建失败：${error || '未知错误'}`)
+    }
+  })
+  // 用后端的权威名单给本地缓存对账：磁盘上已经没有的角色（删除被刷新打断、
+  // 别的标签页删过、手工清过 assets）从下拉框摘掉，否则会留下一个
+  // 「怎么点都删不掉」的幽灵角色。后端不可达时静默跳过。
+  reconcileCustomRoles().then(ghosts => {
+    if (ghosts.length) {
+      ElMessage.warning(`已清理 ${ghosts.length} 个后端不存在的角色：${ghosts.join('、')}`)
+    }
+  })
   // 探针要在任何一次播放之前装好，才能抓到「播放前就被按停」的情况
   installPauseProbe();
   try{
@@ -776,8 +875,9 @@ onBeforeUnmount(() => {
   websocketManager.off('disconnected', handleDisconnected);
   websocketManager.off('error', handleErrorEvent);
   websocketManager.off('message', handleServerMessage);
+  websocketManager.off('progress', handleProgress);
   websocketManager.off('invalid_message', handleInvalidMessage);
-  websocketManager.off('parse_error', handleErrorEvent);
+  websocketManager.off('parse_error', handleParseError);
   websocketManager.disconnect();
 })
 
@@ -792,15 +892,29 @@ onBeforeUnmount(() => {
         <div class="chat-container">
             <!-- 聊天头部，包含标题和设置按钮 -->
             <div class="chat-header">
-                <h1>LLM Galgame</h1>
+                <div class="chat-title-row">
+                    <h1>LLM Galgame</h1>
+                    <!-- Mock 版徽标：仅在 AI 被旁路时出现，避免用户把固定回复当成模型故障 -->
+                    <span v-if="isMockMode" class="mock-badge" :title="mockBadgeHint">
+                        MOCK 模式 · AI 已旁路
+                    </span>
+                </div>
                 <search-bar />
                 <el-button circle :icon="Setting" @click="showSettings = true" />
+            </div>
+
+            <!-- 模型处理中的常驻反馈：聊天框上方左侧的旋转加载条。
+                 仅在正在生成回复（isLoading）时显示，正式回复到达即随 isLoading 置否而清除。 -->
+            <div v-if="isLoading" class="gen-status-bar">
+                <span class="gen-status-spinner" />
+                <span class="gen-status-text">模型思考中…</span>
             </div>
 
             <!-- 消息容器，显示对话消息 -->
             <div class="messages-container" ref="messagesContainer">
                 <template v-if="currentChatMessages.length">
                     <chat-message v-for="message in currentChatMessages" :key="message.id" :message="message"
+                        :loading="isLoading && lastMessage?.role === 'assistant' && message.id === lastMessage.id"
                         @update="handleWebSocketMessageUpdate" @delete="handleMessageDelete"
                         @regenerate="handleRegenerate" />
                 </template>
@@ -817,6 +931,12 @@ onBeforeUnmount(() => {
 
             <!-- 设置面板 -->
             <settings-panel v-model="showSettings" />
+
+            <!-- 角色创建中：左下角滚动加载条，图片/语音全部就绪后自动消失 -->
+            <div v-if="settings.creatingRoles.length" class="role-creating-bar">
+              <span class="role-creating-spinner" />
+              <span>角色创建中</span>
+            </div>
           <!-- 常驻的单一音频元素：src 由 playAudio() 命令式设置。
                不再用 :key 重建元素，也不再靠 <source> + @canplay 自动播放——
                那套写法会让旧元素在被移除前继续发声，造成两段语音重叠。 -->
@@ -841,6 +961,37 @@ onBeforeUnmount(() => {
     display: flex;
     flex-direction: column;
     overflow: hidden; /* 控制溢出 */
+    position: relative; /* 供「角色创建中」提示条定位到聊天区左下角 */
+}
+
+/* 角色创建中：不阻塞交互的轻量提示条 */
+.role-creating-bar {
+    position: absolute;
+    left: 16px;
+    bottom: 16px;
+    z-index: 2000;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    border-radius: 20px;
+    background: rgba(0, 0, 0, 0.72);
+    color: #fff;
+    font-size: 13px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+
+.role-creating-spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(255, 255, 255, 0.35);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: role-creating-spin 0.8s linear infinite;
+}
+
+@keyframes role-creating-spin {
+    to { transform: rotate(360deg); }
 }
 
 /* 设置聊天头部的样式，包括对齐方式和背景色等 */
@@ -858,6 +1009,64 @@ onBeforeUnmount(() => {
         font-size: 1.5rem;
         color: var(--text-color-primary);
     }
+}
+
+/* 标题与 Mock 徽标同一行；徽标只占自身宽度，不挤压 search-bar */
+.chat-title-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+/* Mock 版徽标：琥珀色与设置页的开关配色一致，一眼能认出「当前不是正常链路」 */
+.mock-badge {
+    flex-shrink: 0;
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(196, 125, 26, 0.5);
+    background: rgba(196, 125, 26, 0.14);
+    color: #c47d1a;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: help;
+}
+
+/* 模型处理中的常驻反馈条：聊天框上方左侧，旋转加载条 + 文案。
+   因为它是 .chat-container 的直接子元素（flex column），默认左对齐，
+   且只在 isLoading 时渲染，正式回复到达即随 v-if 消失。 */
+.gen-status-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    align-self: flex-start;
+    margin: 0.5rem 0 0 1rem;
+    padding: 6px 12px;
+    border-radius: 16px;
+    background-color: var(--bg-color);
+    border: 1px solid var(--border-color);
+    color: var(--text-color-secondary);
+    font-size: 13px;
+    box-shadow: var(--box-shadow);
+    z-index: 50;
+}
+
+.gen-status-spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border-color);
+    border-top-color: var(--primary-color);
+    border-radius: 50%;
+    animation: gen-status-spin 0.8s linear infinite;
+}
+
+.gen-status-text {
+    white-space: nowrap;
+}
+
+@keyframes gen-status-spin {
+    to { transform: rotate(360deg); }
 }
 
 /* 定义消息容器的样式，占据剩余空间，支持滚动，自定义背景色 */

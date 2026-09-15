@@ -186,6 +186,20 @@ export const useChatStore = defineStore('chat', {
       }
     },
 
+    // 把模型思考内容的增量片段追加到正在生成的助手消息上（流式展示）。
+    // 思考内容不是正式回复，正式回复到达时由 updateLastMessage(..., '') 清空。
+    appendReasoning(delta: string) {
+      if (!delta) return
+      const conversation = this.conversations.find(
+        conv => conv.id === this.currentGeneratingId
+      )
+      if (!conversation || !conversation.messages.length) return
+      const lastMessage = conversation.messages[conversation.messages.length - 1]
+      if (!lastMessage) return
+      lastMessage.reasoning_content = (lastMessage.reasoning_content || '') + delta
+      conversation.updatedAt = new Date().toISOString()
+    },
+
     updateTokenCount(usage: TokenUsage) {
       const conversation = this.conversations.find(
         conv => conv.id === this.activeConversationId

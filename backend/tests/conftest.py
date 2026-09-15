@@ -40,6 +40,24 @@ except ModuleNotFoundError:
 
 
 @pytest.fixture(autouse=True)
+def force_prod_mode(monkeypatch, tmp_path):
+    """单元测试一律跑在「正式版」口径。
+
+    Mock 版会把整条 AI 链路旁路掉（Integration 直接返回状态回执），
+    那些断言真实调用行为的用例会「通过得毫无意义」。而模式开关是落盘的
+    （backend/runtime_mode.json），本机手工切过一次 mock 就会污染整轮测试。
+    这里把开关文件指到一个不存在的临时路径、并把默认值钉成 prod，
+    等效于「从未切换过」—— 不依赖 `config` 的内部实现。
+    """
+    import config
+
+    monkeypatch.setattr(config, "MODE_PATH", str(tmp_path / "runtime_mode.json"))
+    monkeypatch.setattr(config, "_initial_mode", config.MODE_PROD)
+    assert config.get_mode() == config.MODE_PROD
+    assert not config.is_mock()
+
+
+@pytest.fixture(autouse=True)
 def block_real_external_calls(monkeypatch):
     """任何漏掉的 HTTP/WebSocket 外部调用都应立即使测试失败。"""
 

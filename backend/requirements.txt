@@ -1,12 +1,49 @@
-# LLMGal 后端运行时依赖（Python 3.11–3.14）。
+# LLMGal 后端运行时依赖
+# ---------------------------------------------------------------------------
+# 本文件基于本机可运行的 vue-fastapi 虚拟环境（Python 3.11.13）整理，
+# 仅保留后端代码实际 import 的第三方库（见 backend/*.py 的 import 清单），
+# 并显式列出 volcengine 的其余运行时依赖。
 #
-# 仅保留 Connect.py -> Integration.py -> Text.py / Voice.py / Image.py
-# 真实调用链会导入的包。数据库、Redis、Flask 等历史开发依赖不属于当前运行时，
-# 因而不应阻塞首次部署。火山图像 SDK 请按需安装 requirements-volcengine.txt。
+# 已移除原 pip freeze 中约 80% 未被项目使用的包：
+#   Flask / Jinja2 / Werkzeug / SQLAlchemy / mysqlclient / PyMySQL / redis /
+#   redis-om / loguru / beautifulsoup4 / types-* / win32-setctime / websocat ...
+#
+# 关键坑（已在 tmp venv 实测复现并验证修复）：
+#   volcengine==1.0.192 的元数据硬钉 pycryptodome==3.9.9，而 3.9.9 在
+#   CPython 3.11 上没有预编译轮子，全新安装会尝试源码编译并需要 VC++ 14.0。
+#   因此 pycryptodome 改为钉 3.21.0（有 cp311 的 abi3 轮子，实测可直接安装），
+#   而 volcengine 由部署脚本以 `pip install --no-deps` 安装，避免被拉回 3.9.9。
+#   => 不要把 volcengine 直接写进本文件再用 `pip install -r` 安装。
+#
+# 硬性约束：fastapi==0.95.1 + pydantic==1.10.7 在 Python 3.12 / 3.13 上
+# 导入即报 TypeError（ForwardRef._evaluate 签名变更）。解释器必须锁定 3.11。
+# 部署脚本 scripts/setup_env.sh 会自动校验 Python 版本。
+# ---------------------------------------------------------------------------
 
-fastapi==0.95.1
-pydantic==1.10.26
-uvicorn==0.21.1
-openai==1.93.2
-requests==2.32.4
-websockets==11.0.2
+# —— 直接依赖（后端代码显式 import）——
+fastapi==0.95.1          # Connect.py：FastAPI 应用、CORS、WebSocket
+starlette==0.26.1        # Connect.py / tests：WebSocket 异常类型（fastapi 0.95.1 要求 0.26.x）
+pydantic==1.10.7         # Connect.py：请求体模型（必须 v1，fastapi 0.95.1 不支持 v2）
+uvicorn==0.21.1          # 运行 ASGI 服务（uvicorn Connect:app）
+websockets==11.0.2       # Connect.py / Voice.py：WebSocket 客户端与服务端
+requests==2.32.4         # Image.py / Voice.py / volcengine：HTTP 调用
+openai==1.93.2           # Text.py：OpenAI 兼容接口客户端
+
+# —— 加密依赖（替代 volcengine 硬钉的 3.9.9，cp311 有轮子）——
+pycryptodome==3.21.0     # volcengine 签名依赖；3.9.9 在 cp311 无轮子需 VC++ 编译
+
+# —— volcengine 的其余运行时依赖 ——
+# volcengine 由部署脚本以 --no-deps 安装，其依赖需在此手动列出，否则运行会缺模块。
+retry==0.9.2
+pytz>=2020.5
+protobuf>=3.18.3
+google>=3.0.0
+six>=1.0
+
+# —— 未列入：volcengine==1.0.192 ——
+# 由 scripts/setup_env.sh 以 `pip install --no-deps volcengine==1.0.192` 安装。
+# 如需手动安装：先 `pip install pycryptodome==3.21.0`，再
+# `pip install --no-deps volcengine==1.0.192`，最后 `pip install -r requirements.txt`。
+
+# 测试依赖见 backend/requirements-test.txt（pytest / pytest-asyncio / pytest-cov）。
+# 配置加载由 backend/config.py 自带的极简 .env 解析实现，不依赖 python-dotenv。

@@ -31,6 +31,88 @@ emo_image = [["neutral", "calm with a smile on the face"],
              ["angry", "angry because you said something too rude"],
              ["surprised", "surprised because your response is quite unexpected"],
              ["shy", "shy due to the truth that the person likes you as well, and cheeks are lightly reddish"]]
+
+# --------------------------------------------------------------------------
+# 画风（全项目统一入口）
+# --------------------------------------------------------------------------
+# 项目默认画风：二次元动漫原画。真实取值来自 config.IMAGE_STYLE_PROMPT
+# （.env 可用 IMAGE_STYLE_PROMPT 覆盖）；下面的 ANIME_STYLE_HEAD 只是
+# config 读不到时的兜底常量，保证任何情况下都有画风可用。
+#
+# 2026-09-14 实测（CogView-3-Flash，同一段人物描述只改提示词脚手架）：
+#   ① 旧的「Positive Prompt / [Photography: studio lighting, sharp focus] / Negative prompt」
+#      标签式脚手架 → 出写实照片人像；
+#   ② 只删掉 [Photography] 那一行 → 半写实插画，仍不够二次元；
+#   ③ 风格前置的自然语言写法 → 标准 2D 动漫立绘（赛璐璐上色 + 干净线稿）。
+#
+# 结论：指令式文生图模型（CogView / Seedream 这类）并不理解 SD 的标签脚手架，
+# 其中的 Photography / studio lighting / sharp focus / ultra-high resolution 等
+# 摄影词汇会把画面强烈拉向写实。因此统一改走「风格前置 + 自然语言」，
+# 且提示词里**不出现任何摄影/写实词汇**。
+ANIME_STYLE_HEAD = (
+    "2D anime key visual illustration in Japanese anime style, official anime "
+    "artwork, cel shading, clean line art, flat colors, vibrant, high quality, detailed"
+)
+PORTRAIT_NEGATIVE_HINT = (
+    "No text, no watermark, no signature, no photorealism, no 3D render, no photo."
+)
+# 表情扩展图的负面词；图生图接口单独收 negative_prompt 字段时用（如 byteedit_v2.0）
+EXPRESSION_NEGATIVE = (
+    "low quality, deformed, text, signature, watermark, multiple people, "
+    "background elements, blurry, out of frame"
+)
+
+
+def build_style_head(style=""):
+    """统一的画风前缀 —— **所有出图提示词都必须从这里取画风**。
+
+    优先级：用户显式指定 > config.IMAGE_STYLE_PROMPT（.env 可覆盖）> 内置兜底常量。
+
+    之所以收敛成一个函数：立绘走 build_portrait_prompt、情绪扩展图走
+    build_expression_prompt，两条路径若各自手写画风就很容易越改越偏 ——
+    历史上 emotional_bro 自己写了一段 SD 脚手架，出图风格和立绘对不上。
+    """
+    explicit = (style or "").strip()
+    if explicit:
+        return explicit
+    configured = (getattr(config, "IMAGE_STYLE_PROMPT", "") or "").strip()
+    return configured or ANIME_STYLE_HEAD
+
+
+def build_portrait_prompt(subject, appearance,
+                          expression="neutral, calm with a smile on the face",
+                          style=""):
+    """角色立绘统一提示词（新角色候选图 / 基准图 / 对话实时图都走这里）。
+
+    :param style: 用户显式指定的画风；留空则用项目默认（二次元动漫原画）。
+    """
+    head = build_style_head(style)
+    return (
+        f"{head}, single character, upper body portrait, front view, pure white background. "
+        f"Character: {subject}. "
+        f"Appearance: {appearance}. "
+        f"Expression: {expression}. "
+        f"{PORTRAIT_NEGATIVE_HINT}"
+    )
+
+
+def build_expression_prompt(emotion_name, emotion_reason, style=""):
+    """情绪扩展图统一提示词（图生图 / 其文生图回退都走这里）。
+
+    与立绘共用同一个画风前缀 build_style_head，保证「基准图 → 7 张情绪图」
+    风格统一；同样不使用 SD 标签脚手架（`Positive Prompt:` / `ultra-high
+    resolution` 对指令式模型只是噪声，还会把画面拉向写实）。
+    """
+    head = build_style_head(style)
+    return (
+        f"{head}. Single character, upper body portrait, front view, pure white background. "
+        f"Keep every facial feature, the hair, the outfit and the overall art style "
+        f"identical to the reference image; only change the facial expression. "
+        f"The character looks {emotion_name} because {emotion_reason}. "
+        f"{PORTRAIT_NEGATIVE_HINT}"
+    )
+
+
 def save_image_from_url(url, save_path):
     """将URL图片保存到固定路径（自动创建目录）"""
     try:
@@ -124,11 +206,14 @@ def _openai_image_payload():
     )
 
 
-def generate_image_openai_compatible(prompt, save_path):
+def generate_image_openai_compatible(prompt, save_path, size=None):
     """OpenAI 兼容文生图（智谱 CogView / 火山 Seedream）。
 
     与火山 VisualService 的区别：不需要安装厂商 SDK，一个 HTTP 调用即可，
     且智谱 CogView-3-Flash 属于免费档，适合测试期跑通流程。
+
+    :param size: 覆盖出图尺寸；不给时用 config.IMAGE_ZHIPU_SIZE。
+                 新角色立绘要求「正方形且至少高清」，由调用方显式指定。
     """
     endpoint, model, api_key = _openai_image_payload()
     if not api_key:
@@ -140,7 +225,7 @@ def generate_image_openai_compatible(prompt, save_path):
     response = requests.post(
         url=endpoint,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": model, "prompt": prompt, "size": config.IMAGE_ZHIPU_SIZE},
+        json={"model": model, "prompt": prompt, "size": size or config.IMAGE_ZHIPU_SIZE},
         timeout=120,
     )
     response.raise_for_status()
@@ -165,19 +250,9 @@ def original_image_generation (nameRole, imgEmo, i):
     subject, appearance = get_role_image_prompt(nameRole)
     print(f"开始图像生成, 静态图像, 角色: {nameRole}, 情绪: {imgEmo}, 序号: {i}")
 
-    original_prompt = f"""
-    Positive Prompt: best quality, masterpiece, ultra-high resolution, head portrait, Japanese anime style.
-    
-    [Subject Description: {subject}],
-    [Appearance Details: {appearance}],
-    [Expression Adjustment: {imgEmo}],
-    [Background: pure white background, could contain natural shadows, isolated],
-    [Photography: studio lighting, sharp focus],
-    [Perspective: front view],
-    [Style: anime]
-
-    Negative prompt: low quality, deformed, text, signature, watermark, multiple people, background elements, blurry, out of frame.
-    """
+    # 统一走二次元立绘提示词（旧版的 [Photography: studio lighting, sharp focus]
+    # 会把 CogView 拉向写实人像，实测见 build_portrait_prompt 上方注释）。
+    original_prompt = build_portrait_prompt(subject, appearance, expression=imgEmo)
     savePath = f"../frontend/src/assets/pictures/{nameRole}/{nameRole}_{i}.jpg"
 
     # 火山 VisualService 走原路径；其余（智谱 / Seedream）走 OpenAI 兼容 HTTP。
@@ -218,15 +293,12 @@ def emotional_bro(imaurl, nameRole, emotion, i, modelValue):
     马上新增一个参量，允许调用不同的图生图模型……
     """
 
-    emotional_prompt = f"""
-    Positive Prompt: best quality, masterpiece, ultra-high resolution, head portrait, Japanese anime style.
-    
-    Maintain the image style as well as all the features of the person in this image, and keep the background white,
-    but alter the facial expression of the person so that the person looks {emotion[0]} because {emotion[1]}.
-"""
+    # 表情扩展图与立绘共用同一画风前缀（见 build_expression_prompt）：
+    # 原先这里自己写了一段 "Positive Prompt: best quality, masterpiece,
+    # ultra-high resolution" 的 SD 脚手架，出图风格和立绘对不上。
+    emotional_prompt = build_expression_prompt(emotion[0], emotion[1])
 
-    negative_prompt ="""
-    Negative prompt: low quality, deformed, text, signature, watermark, multiple people, background elements, blurry, out of frame."""
+    negative_prompt = f"\n    Negative prompt: {EXPRESSION_NEGATIVE}"
 
     savePath = f"../frontend/src/assets/pictures/{nameRole}/{nameRole}_{i}.jpg"
     saveUrl = ""
