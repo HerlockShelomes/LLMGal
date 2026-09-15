@@ -19,6 +19,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VENV_DIR = PROJECT_ROOT / ".venv-module1"
 REQUIREMENTS = PROJECT_ROOT / "backend" / "requirements-test.txt"
 RESULT_DIR = PROJECT_ROOT / "artifacts" / "test-results"
+MODULE_ONE_TESTS = (
+    "tests/test_websocket_cases.py",
+    "tests/test_service_and_state_cases.py",
+)
 
 
 def venv_python(venv_dir: Path) -> Path:
@@ -164,7 +168,7 @@ def run_pytest(python: Path, pytest_args: Sequence[str]) -> int:
         str(python),
         "-m",
         "pytest",
-        "tests",
+        *MODULE_ONE_TESTS,
         f"--junitxml={junit_path}",
         "--cov=Connect",
         "--cov=Integration",
