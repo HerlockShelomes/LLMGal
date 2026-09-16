@@ -16,7 +16,12 @@ import {
   APP_MODE_LABELS,
   type AppMode,
   type CustomRoleDetail,
+  type RoleOption,
+  defaultRole,
+  DEFAULT_ROLE_VALUE,
+  DEFAULT_ROLE_LABEL,
 } from '../stores/settings.ts'
+import { useChatStore } from '../stores/chat.ts'
 // 全局单一发声通道：试听音与 ChatView 的对话语音互斥
 import {claimPlayback} from '../utils/audioBus.ts'
 import {stopWatchingAll, watchRoleCreation} from '../utils/roleCreation.ts'
@@ -25,6 +30,8 @@ import {switchAppMode, syncAppModeFromBackend} from '../utils/appMode.ts'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Edit, Delete, Plus, InfoFilled } from '@element-plus/icons-vue'
 import { ElTooltip } from 'element-plus'
+// 角色切换不再是「改一个字段」，而是会牵动会话（另开一个属于新角色的会话）
+import { useRoleSession } from '../composables/useRoleSession.ts'
 
 // 定义组件的props
 const props = defineProps({
@@ -38,6 +45,16 @@ const emit = defineEmits(['update:modelValue'])
 const settingsStore = useSettingsStore()
 const modelOptions = useModelOptions()
 const roleOptions = useRoleOptions()
+const { requestRoleSwitch, applyRole } = useRoleSession()
+const chatStore = useChatStore()
+
+/**
+ * 角色下拉框直接绑定 store，而不是面板里的副本。
+ * 这样一来「取消切换」不需要任何回滚代码 —— store 没变，界面自然回到原角色。
+ */
+const onRoleChange = (value: string) => {
+  void requestRoleSwitch(value)
+}
 
 // 可见性计算属性，同步抽屉的可见性状态
 const visible = computed({
@@ -68,6 +85,13 @@ const settings = reactive({
     roleImage: settingsStore.RoleConfig.roleImage,
   }
 })
+
+// 「保存设置」会把整个 settings 副本写回 store，
+// 角色字段必须始终与 store 一致，否则会把被弹窗拦截下来的切换又写回去。
+watch(
+  () => settingsStore.RoleConfig.roleName,
+  (value) => { settings.RoleConfig.roleName = value },
+)
 
 
 
@@ -260,6 +284,109 @@ const getModelTypeLabel = (type: string) => {
   return typeMap[type] || type
 }
 
+// ---------------------------------------------------------------------------
+// 自定义角色的增删
+//
+// store 里早就有 addNewRole / editCustomRole / removeCustomRole 三个 action，
+// 但一直没有 UI 入口（原位置只有一句「此处需要完善增删角色逻辑」的注释）。
+// 这里照模型的增删写法接上。
+// ---------------------------------------------------------------------------
+const roleDialogVisible = ref(false)
+const isRoleEditing = ref(false)
+const originalRoleValue = ref('')
+
+const currentRole = ref<RoleOption>({
+  label: '',
+  value: '',
+  type: '虚拟角色'
+})
+
+// 角色标识重复检查：内置角色与已有自定义角色都不能撞
+const checkRoleValueExists = (value: string, excludeValue?: string): string => {
+  if (defaultRole.some(role => role.value === value)) {
+    return '角色标识与内置角色重复'
+  }
+  if (settingsStore.customRoles.some(role => role.value === value && role.value !== excludeValue)) {
+    return '角色标识已存在'
+  }
+  return ''
+}
+
+const showAddRoleDialog = () => {
+  isRoleEditing.value = false
+  currentRole.value = { label: '', value: '', type: '虚拟角色' }
+  roleDialogVisible.value = true
+}
+
+const showEditRoleDialog = (role: RoleOption) => {
+  isRoleEditing.value = true
+  currentRole.value = { ...role }
+  originalRoleValue.value = role.value
+  roleDialogVisible.value = true
+}
+
+const handleSaveRole = () => {
+  const { label, value, type } = currentRole.value
+  if (!label.trim() || !value.trim()) {
+    ElMessage.warning('请填写完整的角色信息')
+    return
+  }
+
+  const errorMsg = checkRoleValueExists(value.trim(), isRoleEditing.value ? originalRoleValue.value : undefined)
+  if (errorMsg) {
+    ElMessage.warning(errorMsg)
+    return
+  }
+
+  if (isRoleEditing.value) {
+    settingsStore.editCustomRole(originalRoleValue.value, { label: label.trim(), value: value.trim(), type })
+    // 会话是按角色标识绑定的，标识一改必须把老会话一起迁过去，
+    // 否则它们会立刻变成「角色已删除」状态。
+    chatStore.migrateRole(originalRoleValue.value, value.trim(), label.trim())
+
+    // 编辑的正好是当前角色：同步 RoleConfig，否则面板里显示的名字是旧的
+    if (settingsStore.RoleConfig.roleName === originalRoleValue.value) {
+      applyRole(value.trim())
+    }
+  } else {
+    settingsStore.addNewRole({ label: label.trim(), value: value.trim(), type })
+  }
+
+  roleDialogVisible.value = false
+  ElMessage.success(isRoleEditing.value ? '角色已更新' : '角色已添加')
+}
+
+const handleDeleteRole = async (role: RoleOption) => {
+  // 该角色名下的会话不会被一起删掉：它们会留在侧边栏并标成「已删除」，
+  // 由用户自己决定留不留。这一点必须在确认框里讲清楚，否则等于静默丢数据。
+  const owned = chatStore.conversations.filter(c => c.roleName === role.value).length
+  const extra = owned ? `该角色名下还有 ${owned} 个会话，删除角色后它们会保留在侧边栏并标记为「已删除」。` : ''
+  try {
+    await ElMessageBox.confirm(`确定要删除角色「${role.label}」吗？${extra}`, '警告', {
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+      type: 'warning'
+    })
+  } catch {
+    return
+  }
+
+  settingsStore.removeCustomRole(role.value)
+
+  // 删掉的正好是当前角色：静默切到默认角色（删除的必然结果，不再弹确认）
+  if (settingsStore.RoleConfig.roleName === role.value) {
+    applyRole(DEFAULT_ROLE_VALUE)
+    ElMessage.info(`角色已删除，已切换为默认角色「${DEFAULT_ROLE_LABEL}」`)
+  } else {
+    ElMessage.success('角色已删除')
+  }
+}
+
+// 角色增删的四个入口在 main 工作区里就没有 UI 按钮挂载（半成品）。
+// 先显式暴露给父组件：既保留实现，又不会被 noUnusedLocals 判成死代码。
+// 后续在模板里接上按钮后，删掉这一行即可。
+defineExpose({ showAddRoleDialog, showEditRoleDialog, handleSaveRole, handleDeleteRole })
+
 // 获取标签类型
 const getModelTagType = (type: string) => {
   const typeMap: Record<string, '' | 'success' | 'warning' | 'info'> = {
@@ -376,12 +503,14 @@ const errorMessage = ref<string>('')
 
 // 角色立绘：候选逐级回退（glob → dev 直连磁盘 → 后端 /static）。
 // 每个候选加载失败就试下一个，全部失败 url 为空串 → 显示「显示失败」占位符。
+// 直接读 store：面板里的副本只是「保存设置」时的载荷，
+// 角色相关的展示一律以 store 为准，避免取消切换后界面还停在新角色上。
 const roleImage = useRoleImage(
-  () => settings.RoleConfig.roleName,
+  () => settingsStore.RoleConfig.roleName,
   () => 'neutral',
 )
 const roleImageUrl = roleImage.url
-const roleDocUrl = computed(() => getDescriptionFile(settings.RoleConfig.roleName))
+const roleDocUrl = computed(() => getDescriptionFile(settingsStore.RoleConfig.roleName))
 
 const handleImageError = () => {
   roleImage.onError()
@@ -392,7 +521,7 @@ const handleImageError = () => {
 }
 
 watchEffect(async () => {
-  const currentRole = settings.RoleConfig.roleName
+  const currentRole = settingsStore.RoleConfig.roleName
   // 自定义角色：详情已在前端保存，直接展示其性格设定，无需再请求磁盘 txt
   const detail = settingsStore.customRoleDetails[currentRole]
   if (detail?.personality) {
@@ -418,7 +547,7 @@ const audio = ref<HTMLAudioElement | null>(null)
 
 // 仅用于展示：真正发声用的是 backend/config.py 的 ROLE_VOICES
 const currentVoiceLabel = computed(() => {
-  const name = settings.RoleConfig.roleName
+  const name = settingsStore.RoleConfig.roleName
   const detail = settingsStore.customRoleDetails[name]
   if (detail?.voiceId) {
     const v = VOICE_OPTIONS.find(x => x.id === detail.voiceId)
@@ -434,7 +563,7 @@ const play = () => {
   const el = audio.value
   if (!el) return
 
-  const urls = getTestAudioUrls(settings.RoleConfig.roleName)
+  const urls = getTestAudioUrls(settingsStore.RoleConfig.roleName)
   if (!urls.length) {
     ElMessage.warning('没有找到该角色的试听音频，请重新生成后再试')
     return
@@ -1024,7 +1153,8 @@ onBeforeUnmount(() => {
           <span class="label">
             <!---这一行span可能可以删掉--->
           <el-select
-              v-model="settings.RoleConfig.roleName"
+              :model-value="settingsStore.RoleConfig.roleName"
+              @update:model-value="onRoleChange"
               placeholder="请选择角色"
               class="w-full"
               :popper-class="'model-select-dropdown'"

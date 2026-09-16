@@ -36,6 +36,11 @@ import {
 import { useRSCstore } from "../stores/RoleShowCase.ts";
 import {v4 as uuidv4} from 'uuid';
 
+// 角色与会话的绑定逻辑（进入会话 / 切换角色 / 首屏初始化）
+import { useRoleSession } from '../composables/useRoleSession.ts'
+
+const roleSession = useRoleSession()
+
 // 初始化聊天存储
 const chatStore = useChatStore()
 // 计算属性，获取消息列表和加载状态
@@ -82,10 +87,9 @@ const currentAudioUrl = ref<string>(
 
 const audio = ref<HTMLAudioElement | null>(null)
 
-// 如果没有活动会话，创建一个新会话
-if (!chatStore.activeConversationId) {
-  chatStore.createConversation()
-}
+// 首屏：没有会话就为当前角色建一个；有会话则按会话记录的角色把角色切回去。
+// 必须是 sync 动作而不是等到某个事件，否则刷新页面后角色会和会话对不上。
+roleSession.ensureConversation()
 
 // 监听消息、对话ID变化，滚动到底部
 watch(currentChatMessages, () => {

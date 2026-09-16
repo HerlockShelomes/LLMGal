@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-
+import { DEFAULT_ROLE_LABEL, DEFAULT_ROLE_VALUE } from './settings.ts'
 
 // 定义消息类型
 interface Message {
@@ -22,6 +22,14 @@ const generateId = (): string => {
 
 // 内联在 content 里的 base64 图片
 const INLINE_IMAGE = /!\[[^\]]*\]\((data:image\/[a-zA-Z0-9.+-]+;base64,[^)]*)\)/g
+
+// 标题结构固定为「角色名-对话N」：换角色名时只替换前缀，序号必须留住。
+// 用户手动重命名过的标题（匹配不上）就原样保留，不猜。
+const TITLE_SEQ = /-对话(\d+)$/
+const replaceTitleRole = (title: string, newLabel: string): string => {
+  const seq = title.match(TITLE_SEQ)?.[1]
+  return seq ? `${newLabel}-对话${seq}` : title
+}
 
 // 持久化前剥离 base64：一张图动辄几 MB，全部写进 localStorage（上限约 5MB）
 // 会直接把存储写满并让后续写入抛 QuotaExceededError，整个会话历史都存不进去。
@@ -57,6 +65,11 @@ interface TokenUsage {
 interface Conversation {
   id: string
   title: string
+  // 会话绑定的角色（settings 里 RoleOption.value）。角色-会话是强绑定：
+  // 进入会话要把角色切回来，切换角色则要另开会话。
+  roleName: string
+  // 创建时的角色显示名。角色被删掉后会话仍可能残留，留着名字才能显示而不至于空白。
+  roleLabel: string
   messages: Message[]
   createdAt: string
   updatedAt: string
@@ -69,7 +82,9 @@ interface ChatState {
   activeConversationId: string | null  // 当前展示会话ID
   isLoading: boolean
   currentGeneratingId: string | null  // 当前正在生成回答的会话ID
-  conversationCounter: number  // 会话计数器
+  // 每个角色各自的会话序号，用于生成「某角色-对话N」。
+  // 按角色分开计数，换角色时序号不会互相挤占。
+  roleCounters: Record<string, number>
 }
 
 export const useChatStore = defineStore('chat', {
@@ -78,16 +93,19 @@ export const useChatStore = defineStore('chat', {
     activeConversationId: null,
     isLoading: false,
     currentGeneratingId: null,
-    conversationCounter: 0  
+    roleCounters: {},
   }),
 
   actions: {
-    // 创建新会话
-    createConversation() {
-      this.conversationCounter++
+    // 创建属于某个角色的新会话
+    createConversation(roleName: string = DEFAULT_ROLE_VALUE, roleLabel: string = DEFAULT_ROLE_LABEL) {
+      const seq = (this.roleCounters[roleName] ?? 0) + 1
+      this.roleCounters[roleName] = seq
       const conversation: Conversation = {
         id: generateId(),
-        title: `新会话 ${this.conversationCounter}`,
+        title: `${roleLabel}-对话${seq}`,
+        roleName,
+        roleLabel,
         messages: [],
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -107,11 +125,48 @@ export const useChatStore = defineStore('chat', {
       this.activeConversationId = id
     },
 
+    /**
+     * 角色标识/名称被改写时，把属于它的会话一起迁过去。
+     * 不迁的话会话里的 roleName 会指向一个已经不存在的标识，
+     * 进入会话时只能按「角色已删除」处理——那是数据不一致，不是用户想看到的。
+     */
+    migrateRole(oldValue: string, newValue: string, newLabel: string) {
+      if (oldValue === newValue) {
+        // 只改名：标题里的角色名得跟着换，否则标题和分组对不上
+        this.conversations.forEach(c => {
+          if (c.roleName !== oldValue) return
+          c.roleLabel = newLabel
+          c.title = replaceTitleRole(c.title, newLabel)
+        })
+        return
+      }
+
+      this.conversations.forEach(c => {
+        if (c.roleName !== oldValue) return
+        c.roleName = newValue
+        c.roleLabel = newLabel
+        c.title = replaceTitleRole(c.title, newLabel)
+      })
+
+      // 计数器一起挪：目标角色已有计数时取较大值，避免两个角色序号撞车
+      const moved = this.roleCounters[oldValue]
+      if (typeof moved === 'number') {
+        this.roleCounters[newValue] = Math.max(this.roleCounters[newValue] ?? 0, moved)
+        delete this.roleCounters[oldValue]
+      }
+    },
+
     // 删除会话
     deleteConversation(id: string) {
       const index = this.conversations.findIndex(conv => conv.id === id)
       if (index !== -1) {
+        const removed = this.conversations[index]
         this.conversations.splice(index, 1)
+        // 该角色已无会话：连计数器一起清掉，下次新建又从「对话1」开始。
+        // 不清的话会出现「列表里一个会话都没有，新建却是对话7」。
+        if (removed && !this.conversations.some(c => c.roleName === removed.roleName)) {
+          delete this.roleCounters[removed.roleName]
+        }
         if (this.activeConversationId === id) {
           // 如果删除后没有会话，则创建新会话
           if (this.conversations.length === 0) {
@@ -229,7 +284,7 @@ export const useChatStore = defineStore('chat', {
         
         // 确保会话标题保持不变
         if (!conversation.title) {
-          conversation.title = '新对话'
+          conversation.title = `${conversation.roleLabel || DEFAULT_ROLE_LABEL}-对话1`
         }
         conversation.tokenCount = {
           total: 0,
@@ -265,7 +320,9 @@ export const useChatStore = defineStore('chat', {
   },
 
   persist: {
-    key: 'ai-chat-history',
+    // v2：会话与角色绑定的新结构（旧数据没有 roleName/roleLabel，无法归类，
+    // 直接换 key 丢弃；旧键由 main.ts 启动时清掉，不留在 localStorage 里占空间）。
+    key: 'ai-chat-history-v2',
     storage: localStorage,
     // 写盘时剥离 base64 图片，只保留文本与必要元数据
     serializer: {

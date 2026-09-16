@@ -557,3 +557,9 @@ export const defaultRole: RoleOption[] = [
     { label: '开发者', value: 'Testificate_Boy', type: '数字分身' },
     { label: '开发的幻想', value: 'GirlProgrammer', type: '数字分身'},
 ]
+
+// 兜底角色：会话绑定的角色被删除时切到它。
+// 写成字面量而不是从 defaultRole 里查，是为了避免模块初始化顺序带来的 TDZ
+// （chat.ts 在模块顶层就 import 这两个常量）。
+export const DEFAULT_ROLE_VALUE = 'Testificate'
+export const DEFAULT_ROLE_LABEL = '测试猫娘'

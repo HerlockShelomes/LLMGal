@@ -10,6 +10,14 @@ import App from './App.vue'
 // 使用深色代码主题
 import 'highlight.js/styles/github-dark.css'
 
+// 会话结构升级为「会话绑定角色」，旧记录没有 roleName/roleLabel 无法归类，
+// 一并清掉（旧持久化键）。新键是 ai-chat-history-v2，见 stores/chat.ts。
+try {
+  localStorage.removeItem('ai-chat-history')
+} catch {
+  // 隐私模式下 localStorage 可能不可写，忽略即可
+}
+
 const app = createApp(App)
 const pinia = createPinia()
 pinia.use(piniaPluginPersistedstate)
