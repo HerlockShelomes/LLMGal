@@ -31,3 +31,6 @@ backend/runtime_mode.json.tmp
 # Mock 版每轮复制的固定测试音频（frontend/src/assets/voice/_mock/{角色}/）。
 # 纯运行期产物、且按定义与正式版素材重复，入库只是白白堆一份音频副本。
 frontend/src/assets/voice/_mock/
+
+# 助手会话的工作目录（脚本/日志/临时导出副本），纯过程产物，不该入库。
+.workbuddy/.tmp-scratch/
