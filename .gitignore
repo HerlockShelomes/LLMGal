@@ -2,10 +2,11 @@
 .coverage
 .pytest_cache/
 .venv-module1/
-backend/.venv/
-backend/.env
+backend/.venv*/
+# backend/.env
 frontend/.env.local
 artifacts/test-results/
+# backend/tests_ai/results/
 # 后端每次对话会更新的本地状态和媒体缓存；静态角色资源仍保留在仓库中。
 frontend/src/assets/Records.txt
 frontend/src/assets/voice/*/*_[0-9]_Stream.*

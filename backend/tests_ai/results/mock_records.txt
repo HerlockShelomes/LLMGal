@@ -1,0 +1,3 @@
+Wendy:
+Recent_Url:mock://img/Wendy/static.jpg
+index:0

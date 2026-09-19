@@ -58,7 +58,7 @@ LLMGal/
 
 ## 环境要求
 
-- **Python 3.11**。后端运行依赖锁定了 FastAPI 0.95.1 和 Pydantic 1.10.7，请不要使用 Python 3.12 及以上版本创建运行环境。
+- **Python 3.11–3.14**。基础依赖使用 Pydantic 1.10.26，已处理旧版 Pydantic 在 Python 3.12+ 的导入兼容问题；推荐使用本机已安装的 Python 3.14。
 - **Node.js 22 LTS**（推荐项目 CI 使用的 22.13.1）。Node.js 18+ 可以安装依赖，但 Node.js 25 会导致当前 jsdom/Vitest 的 `localStorage` 兼容错误。
 - npm 10 或更高版本。
 - 正式版聊天需要能够访问所配置模型服务的网络环境；Mock 模式和隔离测试不需要 API Key。
@@ -81,13 +81,13 @@ cd LLMGal
 macOS / Linux：
 
 ```bash
-python3.11 scripts/setup_local.py
+python3 scripts/setup_local.py
 ```
 
 Windows PowerShell / CMD：
 
 ```powershell
-py -3.11 scripts\setup_local.py
+py -3.14 scripts\setup_local.py
 ```
 
 初始化脚本会：
@@ -100,9 +100,9 @@ py -3.11 scripts\setup_local.py
 只初始化一侧或重建后端虚拟环境：
 
 ```bash
-python3.11 scripts/setup_local.py --backend-only
+python3 scripts/setup_local.py --backend-only
 python3 scripts/setup_local.py --frontend-only
-python3.11 scripts/setup_local.py --recreate-venv
+python3 scripts/setup_local.py --recreate-venv
 ```
 
 ### 3. 配置服务
@@ -165,7 +165,7 @@ Vite 默认地址为 `http://localhost:5173/`。停止任一服务请在对应�
 
 ### 可选：安装火山图像 SDK
 
-仅当 `backend/.env` 设置 `IMAGE_PROVIDER=volcengine` 时安装：
+仅当 `backend/.env` 设置 `IMAGE_PROVIDER=volcengine`，且使用厂商 SDK 支持的 Python 环境时安装：
 
 ```bash
 backend/.venv/bin/python -m pip install -r backend/requirements-volcengine.txt
@@ -177,6 +177,8 @@ Windows：
 backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-volcengine.txt
 ```
 
+`volcengine==1.0.192` 的上游依赖在 Python 3.14 上不兼容，因此 Python 3.14 请保持默认的 `IMAGE_PROVIDER=zhipu`。这不影响文本模型、TTS、Mock 模式或模块二的 AI 测试。
+
 ## 测试运行指南
 
 课程的两个模块是两套独立交付：
@@ -185,7 +187,7 @@ backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-volcengi
 | --- | --- | ---: | --- | --- |
 | 模块一：传统测试基础实践 | `scripts/run_module1_tests.*` | 34 passed | 不需要 | 不需要 |
 | 扩展后端回归测试 | `backend/tests/` | 124 passed | 不需要 | 不需要 |
-| 模块二：AI 融合实践（测 AI） | `backend/tests_ai/run_ai_tests.py` | 52 个 AI 用例 | 离线自检不需要；真实测试需要 | 不需要 |
+| 模块二：AI 融合实践（测 AI） | `backend/tests_ai/run_ai_tests.py` | 18 个 AI 用例 | 离线自检不需要；真实测试需要 | 不需要 |
 | 前端单元/组件测试 | Vitest | 23 passed | 不需要 | 不需要 |
 | WebSocket 端到端测试 | `backend/test_websocket.py` | 1 条真实链路 | 需要 | 需要 |
 
@@ -258,7 +260,7 @@ cd backend
 
 ### 模块二：AI 测试
 
-模块二采用“方案 1：测 AI”，`backend/tests_ai/run_ai_tests.py` 定义了 52 个 AI 用例，覆盖鲁棒性、安全性、公平性、情绪协议、多模态耦合和角色一致性。TTS 与图片调用在该脚本中使用测试替身隔离；不带 `--mock-llm` 时仍会调用真实文本模型并可能产生费用。
+模块二采用“方案 1：测 AI”，`backend/tests_ai/run_ai_tests.py` 保留原有 18 个核心 AI 用例：鲁棒性、安全性、公平性各 6 条。TTS 与图片调用在该脚本中使用测试替身隔离；不带 `--mock-llm` 时仍会调用真实文本模型并可能产生费用。
 
 先运行不调用真实模型的脚手架自检：
 

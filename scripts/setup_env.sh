@@ -7,14 +7,13 @@ export PYTHONDONTWRITEBYTECODE=1
 # ---------------------------------------------------------------------------
 # LLMGal 后端环境一键部署
 #
-# 前置：Python 3.11（fastapi==0.95.1 + pydantic==1.10.7 在 3.12/3.13 上导入即
-#       报 TypeError，解释器必须钉死 3.11）。
+# 前置：Python 3.11–3.14（推荐当前机器已安装的最高兼容版本）。
 #
 # 用法：
 #   ./scripts/setup_env.sh                 # 仅后端运行时依赖
 #   ./scripts/setup_env.sh --with-test     # 额外安装 backend/requirements-test.txt
 #   ./scripts/setup_env.sh --with-frontend # 额外执行前端 npm ci
-#   LLMGAL_PYTHON=/path/to/python3.11 ./scripts/setup_env.sh   # 指定基座解释器
+#   LLMGAL_PYTHON=/path/to/python3.14 ./scripts/setup_env.sh   # 指定基座解释器
 #   LLMGAL_ENV_BACKEND=/path/to/venv  ./scripts/setup_env.sh   # 指定虚拟环境目录
 #
 # 复刻本机 vue-fastapi(Conda) 环境的等价手动步骤见文件底部注释。
@@ -58,11 +57,10 @@ venv_python() {
   fi
 }
 
-# 版本断言：必须 3.11
-assert_py311() {
-  if ! "$@" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)' >/dev/null 2>&1; then
-    echo "解释器 [$*] 不是 Python 3.11，拒绝继续。" >&2
-    echo "fastapi==0.95.1 + pydantic==1.10.7 在 Python 3.12/3.13 上收集阶段即报 TypeError。" >&2
+# 版本断言：基础依赖支持 3.11–3.14。
+assert_supported_python() {
+  if ! "$@" -c 'import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] <= (3, 14) else 1)' >/dev/null 2>&1; then
+    echo "解释器 [$*] 不在支持范围 Python 3.11–3.14 内，拒绝继续。" >&2
     exit 1
   fi
 }
@@ -73,26 +71,30 @@ resolve_base_python() {
     BASE_PY=("${LLMGAL_PYTHON}")
     return
   fi
-  if command -v python3.11 >/dev/null 2>&1; then
-    BASE_PY=(python3.11)
-  elif command -v py >/dev/null 2>&1 && py -3.11 -c 'import sys' >/dev/null 2>&1; then
-    BASE_PY=(py -3.11)
-  elif command -v python3 >/dev/null 2>&1 \
-       && python3 -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)' >/dev/null 2>&1; then
-    BASE_PY=(python3)
-  else
-    echo "未找到 Python 3.11 解释器。请安装 Python 3.11，或在运行前指定：" >&2
-    echo "  LLMGAL_PYTHON=/c/Users/<you>/AppData/Local/Programs/Python/Python311/python.exe" >&2
-    echo "  LLMGAL_PYTHON=\"py -3.11\"   # Windows 上也可用 py 启动器" >&2
-    exit 1
-  fi
+  local candidate
+  for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+    if command -v "${candidate}" >/dev/null 2>&1 \
+       && "${candidate}" -c 'import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] <= (3, 14) else 1)' >/dev/null 2>&1; then
+      BASE_PY=("${candidate}")
+      return
+    fi
+  done
+  for candidate in 3.14 3.13 3.12 3.11; do
+    if command -v py >/dev/null 2>&1 \
+       && py -"${candidate}" -c 'import sys' >/dev/null 2>&1; then
+      BASE_PY=(py -"${candidate}")
+      return
+    fi
+  done
+  echo "未找到 Python 3.11–3.14 解释器。请安装兼容版本，或通过 LLMGAL_PYTHON 指定解释器路径。" >&2
+  exit 1
 }
 
 VENV_PY="$(venv_python || true)"
 
 if [[ -z "${VENV_PY}" ]]; then
   resolve_base_python
-  assert_py311 "${BASE_PY[@]}"
+  assert_supported_python "${BASE_PY[@]}"
   echo "[环境] 创建虚拟环境：${VENV_DIR}"
   "${BASE_PY[@]}" -m venv "${VENV_DIR_NATIVE}"
   VENV_PY="$(venv_python)"
@@ -103,7 +105,7 @@ if [[ -z "${VENV_PY}" ]]; then
   exit 1
 fi
 
-assert_py311 "${VENV_PY}"
+assert_supported_python "${VENV_PY}"
 
 echo "[环境] 使用解释器：$(${VENV_PY} --version)"
 echo "[环境] 升级 pip ..."
@@ -112,11 +114,8 @@ echo "[环境] 升级 pip ..."
 echo "[依赖] 安装 backend/requirements.txt"
 "${VENV_PY}" -m pip install -r "${BACKEND_NATIVE}/requirements.txt"
 
-# volcengine 元数据硬钉 pycryptodome==3.9.9（cp311 无轮子，需 VC++ 编译）。
-# 用 --no-deps 安装，避免 pip 把它拉回 3.9.9 源码编译失败；pycryptodome 3.21.0
-# 已由 requirements.txt 先行装好（abi3 轮子，cp311 可直接安装）。
-echo "[依赖] 安装 volcengine==1.0.192 (--no-deps，绕过 pycryptodome 过度钉版本)"
-"${VENV_PY}" -m pip install --no-deps "volcengine==1.0.192"
+# 火山旧版图像 SDK 不自动安装：其上游依赖在 Python 3.14 不兼容。
+# 默认 zhipu 图像、文本模型、TTS 和模块二 AI 测试均不需要该 SDK。
 
 if [[ "${WITH_TEST}" -eq 1 ]]; then
   echo "[依赖] 安装 backend/requirements-test.txt"
@@ -145,7 +144,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # 复刻本机 vue-fastapi(Conda) 环境的等价手动步骤：
-#   conda create -n vue-fastapi python=3.11 -y
+#   conda create -n vue-fastapi python=3.14 -y
 #   conda activate vue-fastapi
 #   pip install -r backend/requirements.txt
 #   # 测试依赖：

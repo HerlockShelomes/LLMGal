@@ -1,3 +1,10 @@
 # 仅当 backend/.env 中 IMAGE_PROVIDER=volcengine 时需要。
+#
+# 注意：旧版 volcengine==1.0.192 上游硬钉 pycryptodome==3.9.9；该组合无法
+# 可靠支持 CPython 3.14。因此它刻意不再属于基础安装流程，也不会被
+# scripts/setup_env.* 自动安装。Python 3.14 使用者请保持 IMAGE_PROVIDER=zhipu。
+# 若必须使用该旧 SDK，请在厂商提供的兼容 Python 环境中按其文档单独部署，
+# 不影响文本模型、TTS、Mock 模式和模块二的 18 条 AI 测试。
+
 -r requirements.txt
-volcengine==1.0.192
+volcengine==1.0.192 ; python_version < "3.14"
