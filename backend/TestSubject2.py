@@ -4,9 +4,12 @@ import re
 import sys
 import time
 
+import config
 
-ACCESS = 'AKLTODlhZDdkMzc3OTU3NGE3Zjk2NWIwODlkNDY2ZDQ1Y2I'
-SECRET = 'T1RrME1HRTFaVFppWkRNMk5EUTJZMkUwTURnMllUUmhNelZoT1dSa01UZw=='
+# 火山引擎密钥从 backend/.env / 环境变量读取（见 .env.example），
+# 使用前先确认 config.IMAGE_VOLC_ACCESS_KEY / IMAGE_VOLC_SECRET_KEY 已配置。
+ACCESS = config.IMAGE_VOLC_ACCESS_KEY
+SECRET = config.IMAGE_VOLC_SECRET_KEY
 prompt_original = f"""a 9 years old senior citizen with yellow hair and rather thin eyebrows, anime style"""
 
 

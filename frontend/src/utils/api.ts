@@ -1,7 +1,9 @@
 import { useSettingsStore } from '../stores/settings'
 
-// 定义API基础URL
-const API_BASE_URL = 'https://api.siliconflow.cn/v1'
+// 定义API基础URL：可通过 frontend/.env.local 的 VITE_LLM_API_BASE 覆盖
+// （例如切换到其他 OpenAI 兼容服务）；未设置时默认 SiliconFlow。
+// API Key 由用户在应用「设置」面板中填写，不写入源码。
+const API_BASE_URL = (import.meta.env.VITE_LLM_API_BASE || 'https://api.siliconflow.cn/v1').replace(/\/+$/, '')
 //const API_VOLCANO_URL = 'wss://openspeech.bytedance.com/api/v1/tts/ws_binary'
 
 // 定义视觉语言模型相关接口

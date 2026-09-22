@@ -1,21 +1,45 @@
+"""火山引擎视觉 API 手动调试脚本（图生图·表情改写示例）。
+
+密钥不再硬编码：与 config.py 的统一密钥管理保持一致，从 backend/.env /
+环境变量读取 IMAGE_VOLC_ACCESS_KEY / IMAGE_VOLC_SECRET_KEY（参考 .env.example）。
+
+用法：
+    python image_emotions.py <待处理的图片URL>
+"""
 from __future__ import print_function
+
+import sys
+
 from volcengine.visual.VisualService import VisualService
-# 你的密钥信息
-ACCESS = 'AKLTODlhZDdkMzc3OTU3NGE3Zjk2NWIwODlkNDY2ZDQ1Y2I'
-SECRET = 'T1RrME1HRTFaVFppWkRNMk5EUTJZMkUwTURnMllUUmhNelZoT1dSa01UZw=='
+
+import config
+
 prompt = """
 Maintain the image style as well as all the features of the girl in this image, and keep the background white,
-but alter her facial experssions so that she looks happy because she likes spending time with you.
+but alter her facial experssions so she looks happy because she likes spending time with you.
 At the same time, alter her pose to be waving hands at you.
 """
-imaurl = "https://p26-aiop-sign.byteimg.com/tos-cn-i-vuqhorh59i/2025070815485819CDF93FB892EFCD5217-0~tplv-vuqhorh59i-image.image?rk3s=7f9e702d&x-expires=1752047352&x-signature=FLbZfewVM7yJHfSqXOy99UbqwBQ%3D"
 
 if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print("用法: python image_emotions.py <图片URL>", file=sys.stderr)
+        raise SystemExit(1)
+    imaurl = sys.argv[1]
+
+    if not (config.IMAGE_VOLC_ACCESS_KEY and config.IMAGE_VOLC_SECRET_KEY):
+        print(
+            "缺少火山引擎密钥：请在 backend/.env 中配置 "
+            "IMAGE_VOLC_ACCESS_KEY / IMAGE_VOLC_SECRET_KEY"
+            "（参考 .env.example），不要把密钥写进源码。",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
     visual_service = VisualService()
 
     # call below method if you don't set ak and sk in $HOME/.volc/config
-    visual_service.set_ak(ACCESS)
-    visual_service.set_sk(SECRET)
+    visual_service.set_ak(config.IMAGE_VOLC_ACCESS_KEY)
+    visual_service.set_sk(config.IMAGE_VOLC_SECRET_KEY)
 
     # 请求Body(查看接口文档请求参数-请求示例，将请求参数内容复制到此)
     form = {
