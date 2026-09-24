@@ -32,3 +32,13 @@ backend/runtime_mode.json.tmp
 # Mock 版每轮复制的固定测试音频（frontend/src/assets/voice/_mock/{角色}/）。
 # 纯运行期产物、且按定义与正式版素材重复，入库只是白白堆一份音频副本。
 frontend/src/assets/voice/_mock/
+
+# 本机 AI 助手的工作目录（记忆、临时状态）。
+# 属工具本地数据、非项目源码，入库会把协作过程一起带走。
+.workbuddy/
+
+# 临时调试探针脚本：一次性的排查工具，用完即弃，不属交付内容。
+*_probe.py
+
+# 本地工作笔记：记录一次性的修复/恢复过程，非项目文档。
+artifacts/RESTORE_AND_FIX_NOTES.md
