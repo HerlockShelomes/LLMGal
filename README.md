@@ -51,7 +51,6 @@ LLMGal/
 │   ├── setup_local.py              # 跨平台本地初始化
 │   ├── start_backend.py            # 后端启动入口
 │   └── run_module1_tests.*         # 模块一 34 条测试的一键入口
-├── docs/module1/                   # 模块一用例、报告与配置说明
 ├── artifacts/                      # 测试报告和调试产物
 └── README.md
 ```
@@ -237,8 +236,6 @@ python3 scripts/run_module1_tests.py --python python3.11 --recreate-venv
 
 - `artifacts/test-results/pytest-output.txt`
 - `artifacts/test-results/module1-junit.xml`
-
-用例清单见 `docs/module1/LLMGal_backend_34_test_cases.md`。
 
 ### 扩展后端回归测试
 
